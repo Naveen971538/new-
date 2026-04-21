@@ -1,7 +1,9 @@
-"""Agentic Reddit news AI.
+"""Agentic Reddit news AI (OpenRouter edition).
 
 Give it a topic; it decides which subreddits to search, which posts to read
 deeply, and when it has enough material to write a news-style briefing.
+
+Uses OpenRouter (OpenAI-compatible API) so you can run on free models.
 
 Usage:
     python reddit_news_agent.py "latest AI news"
@@ -17,14 +19,15 @@ import os
 import sys
 from typing import Any
 
-import anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from agent_tools import TOOLS, FinalizeSignal, dispatch
 
 load_dotenv()
 
-MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 MAX_TOKENS = 4096
 
 SYSTEM_PROMPT = """\
@@ -98,15 +101,42 @@ def _build_user_message(topic: str, subreddits: list[str] | None) -> str:
     return "\n".join(lines)
 
 
-def _print_trace(step: int, block: Any) -> None:
-    if block.type == "text" and block.text.strip():
-        print(f"  [step {step}] thought: {block.text.strip()[:200]}", file=sys.stderr)
-    elif block.type == "tool_use":
-        args_preview = json.dumps(block.input, ensure_ascii=False)[:200]
+def _print_trace(step: int, message: Any) -> None:
+    content = getattr(message, "content", None)
+    if content:
+        print(f"  [step {step}] thought: {content.strip()[:200]}", file=sys.stderr)
+    for tc in getattr(message, "tool_calls", None) or []:
+        args_preview = (tc.function.arguments or "")[:200]
         print(
-            f"  [step {step}] tool: {block.name}({args_preview})",
+            f"  [step {step}] tool: {tc.function.name}({args_preview})",
             file=sys.stderr,
         )
+
+
+def _assistant_message_to_dict(message: Any) -> dict:
+    out: dict = {"role": "assistant", "content": message.content or ""}
+    if getattr(message, "tool_calls", None):
+        out["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in message.tool_calls
+        ]
+    return out
+
+
+def _parse_tool_args(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
 
 
 def run_agent(
@@ -115,69 +145,84 @@ def run_agent(
     max_steps: int = 15,
     trace: bool = False,
 ) -> str:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set. Add it to .env or your shell.")
+        raise RuntimeError(
+            "OPENROUTER_API_KEY not set. Add it to .env or your shell. "
+            "Get a free key at https://openrouter.ai/keys"
+        )
 
-    client = anthropic.Anthropic(api_key=api_key)
+    base_url = os.environ.get("OPENROUTER_BASE_URL", DEFAULT_BASE_URL)
+    model = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        default_headers={
+            "HTTP-Referer": "https://github.com/naveen971538/new-",
+            "X-Title": "Reddit News Agent",
+        },
+    )
+
     messages: list[dict] = [
-        {"role": "user", "content": _build_user_message(topic, subreddits)}
-    ]
-    system_blocks = [
-        {
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": _build_user_message(topic, subreddits)},
     ]
 
     for step in range(1, max_steps + 1):
-        response = client.messages.create(
-            model=MODEL,
+        response = client.chat.completions.create(
+            model=model,
             max_tokens=MAX_TOKENS,
-            system=system_blocks,
             tools=TOOLS,
             messages=messages,
         )
+        choice = response.choices[0]
+        message = choice.message
 
         if trace:
-            for block in response.content:
-                _print_trace(step, block)
+            _print_trace(step, message)
 
-        messages.append({"role": "assistant", "content": response.content})
+        messages.append(_assistant_message_to_dict(message))
 
-        if response.stop_reason != "tool_use":
-            return _force_finalize(client, messages, system_blocks, trace, reason="model stopped without calling finalize_briefing")
+        tool_calls = message.tool_calls or []
+        if not tool_calls:
+            return _force_finalize(
+                client,
+                model,
+                messages,
+                trace,
+                reason="model stopped without calling finalize_briefing",
+            )
 
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        for tc in tool_calls:
+            args = _parse_tool_args(tc.function.arguments)
             try:
-                result = dispatch(block.name, block.input)
+                result = dispatch(tc.function.name, args)
             except FinalizeSignal as finalize:
                 if trace:
                     print(f"  [step {step}] finalize_briefing received", file=sys.stderr)
                 return finalize.briefing
-            tool_results.append(
-                {"type": "tool_result", "tool_use_id": block.id, "content": result}
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                }
             )
-
-        messages.append({"role": "user", "content": tool_results})
 
     return _force_finalize(
         client,
+        model,
         messages,
-        system_blocks,
         trace,
         reason="research budget exhausted",
     )
 
 
 def _force_finalize(
-    client: anthropic.Anthropic,
+    client: OpenAI,
+    model: str,
     messages: list[dict],
-    system_blocks: list[dict],
     trace: bool,
     reason: str,
 ) -> str:
@@ -193,25 +238,29 @@ def _force_finalize(
             ),
         }
     )
-    response = client.messages.create(
-        model=MODEL,
+    response = client.chat.completions.create(
+        model=model,
         max_tokens=MAX_TOKENS,
-        system=system_blocks,
         tools=TOOLS,
-        tool_choice={"type": "tool", "name": "finalize_briefing"},
+        tool_choice={"type": "function", "function": {"name": "finalize_briefing"}},
         messages=messages,
     )
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "finalize_briefing":
-            return block.input.get("briefing_markdown", "").strip() or (
-                "# Briefing\n\n_No briefing content returned._"
-            )
+    message = response.choices[0].message
+    for tc in message.tool_calls or []:
+        if tc.function.name == "finalize_briefing":
+            args = _parse_tool_args(tc.function.arguments)
+            text = (args.get("briefing_markdown") or "").strip()
+            if text:
+                return text
+    # Some free models ignore tool_choice and answer in plain text — fall back.
+    if message.content:
+        return message.content.strip()
     return "# Briefing\n\n_Agent failed to produce a briefing._"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Agentic Reddit news AI — Claude plans its own research and writes a briefing."
+        description="Agentic Reddit news AI — the model plans its own research and writes a briefing (OpenRouter)."
     )
     parser.add_argument("topic", help="What to research (e.g. 'latest AI news').")
     parser.add_argument(

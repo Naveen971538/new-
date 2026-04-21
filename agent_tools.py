@@ -1,4 +1,4 @@
-"""Claude tool schemas and dispatcher for the Reddit news agent."""
+"""OpenAI/OpenRouter tool schemas and dispatcher for the Reddit news agent."""
 
 from __future__ import annotations
 
@@ -16,16 +16,27 @@ class FinalizeSignal(Exception):
         self.briefing = briefing
 
 
+def _tool(name: str, description: str, parameters: dict) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    }
+
+
 TOOLS: list[dict] = [
-    {
-        "name": "search_reddit",
-        "description": (
+    _tool(
+        "search_reddit",
+        (
             "Search Reddit for posts matching a query. Use this FIRST when you "
             "need a broad landscape scan, or to discover which subreddits are "
             "most active on a topic. Restrict to a specific subreddit by "
             "passing `subreddit`."
         ),
-        "input_schema": {
+        {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query."},
@@ -50,15 +61,15 @@ TOOLS: list[dict] = [
             },
             "required": ["query"],
         },
-    },
-    {
-        "name": "list_subreddit_posts",
-        "description": (
+    ),
+    _tool(
+        "list_subreddit_posts",
+        (
             "List posts from a single subreddit (hot/top/new/rising). Use this "
             "once you've identified a relevant community and want its current "
             "front page."
         ),
-        "input_schema": {
+        {
             "type": "object",
             "properties": {
                 "subreddit": {
@@ -82,14 +93,14 @@ TOOLS: list[dict] = [
             },
             "required": ["subreddit"],
         },
-    },
-    {
-        "name": "get_post_details",
-        "description": (
+    ),
+    _tool(
+        "get_post_details",
+        (
             "Fetch a post's full selftext and its top comments. Use this to go "
             "deeper on a headline that looks newsworthy before writing it up."
         ),
-        "input_schema": {
+        {
             "type": "object",
             "properties": {
                 "post_id": {
@@ -103,15 +114,15 @@ TOOLS: list[dict] = [
             },
             "required": ["post_id"],
         },
-    },
-    {
-        "name": "finalize_briefing",
-        "description": (
+    ),
+    _tool(
+        "finalize_briefing",
+        (
             "TERMINAL: call exactly once when research is complete. Submit the "
             "final markdown news briefing. After this is called, no further "
             "tools will run."
         ),
-        "input_schema": {
+        {
             "type": "object",
             "properties": {
                 "briefing_markdown": {
@@ -121,7 +132,7 @@ TOOLS: list[dict] = [
             },
             "required": ["briefing_markdown"],
         },
-    },
+    ),
 ]
 
 
@@ -130,7 +141,7 @@ def _encode(payload: Any) -> str:
 
 
 def dispatch(tool_name: str, tool_input: dict) -> str:
-    """Run a tool call. Returns a JSON string to put in a tool_result block.
+    """Run a tool call. Returns a JSON string for the tool message content.
 
     Raises FinalizeSignal when the model calls finalize_briefing.
     """
