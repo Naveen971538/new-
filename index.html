@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UK Payslip Calculator</title>
+<style>
+  :root {
+    --ps-dark:    #1a3a6c;
+    --ps-mid:     #2d5f9e;
+    --ps-accent:  #d0e0f4;
+    --ps-border:  #b0c4de;
+    --ps-bg:      #f5f8fc;
+    --ps-white:   #ffffff;
+    --ps-text:    #1a1a2e;
+    --ps-net-bg:  #ccd9f0;
+    --ps-net-bdr: #1a3a6c;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: system-ui, Arial, sans-serif;
+    font-size: 14px;
+    background: #e8eef6;
+    color: var(--ps-text);
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 20px;
+    padding: 20px;
+    min-height: 100vh;
+    align-items: start;
+  }
+
+  #input-panel {
+    background: var(--ps-white);
+    border: 1px solid var(--ps-border);
+    border-radius: 8px;
+    padding: 18px;
+    position: sticky;
+    top: 20px;
+  }
+
+  #input-panel h2 {
+    background: var(--ps-dark);
+    color: var(--ps-white);
+    margin: -18px -18px 14px -18px;
+    padding: 12px 18px;
+    border-radius: 8px 8px 0 0;
+    font-size: 15px;
+    letter-spacing: 0.3px;
+  }
+
+  fieldset {
+    border: 1px solid var(--ps-border);
+    border-radius: 6px;
+    padding: 10px 12px 12px;
+    margin-bottom: 14px;
+  }
+
+  legend {
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--ps-dark);
+    padding: 0 6px;
+  }
+
+  .field-row {
+    display: grid;
+    grid-template-columns: 130px 1fr;
+    align-items: center;
+    margin-bottom: 8px;
+    gap: 6px;
+  }
+
+  .field-row label { font-size: 12px; color: #444; font-weight: 500; }
+
+  input[type=text], input[type=number], input[type=date] {
+    width: 100%;
+    padding: 5px 8px;
+    border: 1px solid var(--ps-border);
+    border-radius: 4px;
+    font-size: 13px;
+    background: var(--ps-bg);
+  }
+
+  input:focus { outline: 2px solid var(--ps-mid); border-color: var(--ps-mid); background: #fff; }
+  input.error { border-color: #c0392b; background: #fff5f5; }
+  .field-error { color: #c0392b; font-size: 11px; grid-column: 2; margin-top: -4px; }
+
+  #lines-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 8px; }
+  #lines-table th {
+    background: var(--ps-accent);
+    color: var(--ps-dark);
+    padding: 5px 4px;
+    text-align: left;
+    font-size: 11px;
+    border-bottom: 2px solid var(--ps-border);
+  }
+  #lines-table td { padding: 4px 3px; border-bottom: 1px solid #dde6f0; vertical-align: middle; }
+  #lines-table input { padding: 3px 5px; font-size: 12px; }
+  #lines-table input[type=number] { text-align: right; }
+  .line-amount { text-align: right; font-family: 'Courier New', monospace; color: #234; min-width: 60px; padding-right: 4px; }
+  .btn-del { background: none; border: none; cursor: pointer; color: #c0392b; font-size: 16px; line-height: 1; padding: 0 2px; }
+
+  details { margin-bottom: 14px; }
+  details summary {
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--ps-dark);
+    background: var(--ps-accent);
+    padding: 6px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--ps-border);
+    user-select: none;
+    list-style: none;
+  }
+  details summary::before { content: "\25B6 "; font-size: 10px; }
+  details[open] summary::before { content: "\25BC "; }
+  details > div { border: 1px solid var(--ps-border); border-top: none; padding: 10px 12px; border-radius: 0 0 4px 4px; }
+
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { padding: 8px 16px; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .btn-primary { background: var(--ps-dark); color: #fff; }
+  .btn-primary:hover { background: var(--ps-mid); }
+  .btn-secondary { background: var(--ps-accent); color: var(--ps-dark); border: 1px solid var(--ps-border); }
+  .btn-add { background: none; border: 1px dashed var(--ps-mid); color: var(--ps-mid); font-size: 12px; padding: 5px 10px; border-radius: 4px; cursor: pointer; margin-bottom: 8px; }
+
+  .disclaimer {
+    font-size: 10px; color: #666; margin-top: 10px; padding: 6px 8px;
+    background: #fff8e6; border: 1px solid #f0d080; border-radius: 4px;
+  }
+
+  #payslip-output {
+    background: var(--ps-white);
+    border: 1px solid var(--ps-border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .ps-placeholder { padding: 60px 40px; text-align: center; color: #8899aa; }
+  .ps-placeholder .icon { font-size: 48px; margin-bottom: 12px; }
+
+  .ps-header {
+    background: var(--ps-dark);
+    color: var(--ps-white);
+    display: grid;
+    grid-template-columns: 1fr auto;
+    padding: 10px 16px;
+    align-items: center;
+  }
+  .ps-header .company { font-weight: 700; font-size: 15px; }
+  .ps-header .title { font-size: 13px; letter-spacing: 1px; text-transform: uppercase; opacity: 0.85; }
+
+  .ps-emp-bar {
+    background: var(--ps-dark);
+    color: var(--ps-white);
+    display: grid;
+    grid-template-columns: 60px 1fr auto auto;
+    gap: 0 20px;
+    padding: 6px 16px;
+    font-size: 12px;
+    border-top: 1px solid rgba(255,255,255,0.15);
+  }
+  .ps-emp-bar span { display: flex; flex-direction: column; }
+  .ps-emp-bar .lbl { font-size: 10px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.4px; }
+  .ps-emp-bar .val { font-weight: 600; font-size: 13px; }
+
+  .ps-meta {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    background: var(--ps-accent);
+    border-bottom: 2px solid var(--ps-dark);
+    font-size: 11px;
+  }
+  .ps-meta-cell { padding: 6px 12px; border-right: 1px solid var(--ps-border); }
+  .ps-meta-cell:last-child { border-right: none; }
+  .ps-meta-cell .lbl { color: #555; text-transform: uppercase; font-size: 10px; letter-spacing: 0.4px; }
+  .ps-meta-cell .val { font-weight: 700; font-size: 12px; color: var(--ps-dark); }
+
+  .ps-body { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 2px solid var(--ps-dark); }
+  .ps-col { border-right: 1px solid var(--ps-border); }
+  .ps-col:last-child { border-right: none; }
+
+  .ps-col-hdr {
+    background: var(--ps-dark);
+    color: var(--ps-white);
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    display: grid;
+  }
+  .ps-col-hdr.payments-hdr { grid-template-columns: 1fr 52px 60px 70px; gap: 4px; }
+  .ps-col-hdr.deductions-hdr { grid-template-columns: 1fr auto; }
+
+  .pay-row {
+    display: grid;
+    grid-template-columns: 1fr 52px 60px 70px;
+    gap: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    border-bottom: 1px solid #e8eef6;
+    align-items: center;
+  }
+  .pay-row:nth-child(even) { background: var(--ps-bg); }
+  .pay-row .r { text-align: right; font-family: 'Courier New', monospace; }
+
+  .holidays-row {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: #555;
+    border-top: 1px solid var(--ps-border);
+    margin-top: 4px;
+    display: flex;
+    gap: 16px;
+  }
+
+  .ded-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    padding: 5px 12px;
+    font-size: 12px;
+    border-bottom: 1px solid #e8eef6;
+    align-items: center;
+  }
+  .ded-row:nth-child(even) { background: var(--ps-bg); }
+  .ded-row .r { font-family: 'Courier New', monospace; font-weight: 600; min-width: 70px; text-align: right; }
+
+  .ps-summary { display: grid; grid-template-columns: 1fr 1fr; }
+  .ps-sum-col { padding: 0; }
+  .ps-sum-col:first-child { border-right: 1px solid var(--ps-border); }
+
+  .ps-sum-hdr {
+    background: var(--ps-dark);
+    color: var(--ps-white);
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .sum-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    padding: 4px 12px;
+    font-size: 12px;
+    border-bottom: 1px solid #e8eef6;
+    align-items: center;
+  }
+  .sum-row:nth-child(even) { background: var(--ps-bg); }
+  .sum-row .r { font-family: 'Courier New', monospace; min-width: 72px; text-align: right; }
+
+  .ps-footer {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 10px 16px;
+    background: #f0f5fc;
+    border-top: 1px solid var(--ps-border);
+    gap: 16px;
+  }
+  .ps-footer .meta-text { font-size: 11px; color: #555; display: flex; gap: 14px; flex-wrap: wrap; }
+  .ps-footer .meta-text span { white-space: nowrap; }
+  .net-pay-box {
+    background: var(--ps-net-bg);
+    border: 2px solid var(--ps-net-bdr);
+    border-radius: 5px;
+    padding: 8px 20px;
+    text-align: center;
+    min-width: 140px;
+  }
+  .net-pay-box .lbl { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--ps-dark); }
+  .net-pay-box .val { font-size: 20px; font-weight: 800; color: var(--ps-dark); font-family: 'Courier New', monospace; }
+
+  #print-btn {
+    display: block;
+    margin: 12px 16px;
+    padding: 8px 18px;
+    background: var(--ps-dark);
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  @media print {
+    body { grid-template-columns: 1fr; background: #fff; padding: 0; }
+    #input-panel { display: none; }
+    #print-btn, #copy-ytd-btn { display: none !important; }
+    #payslip-output { border: none; border-radius: 0; width: 100%; }
+  }
+
+  @media (max-width: 900px) {
+    body { grid-template-columns: 1fr; }
+    #input-panel { position: static; }
+  }
+</style>
+</head>
+<body>
+
+<div id="input-panel">
+  <h2>&#128203; Payslip Calculator</h2>
+
+  <fieldset>
+    <legend>Employee Details</legend>
+    <div class="field-row"><label for="f-company">Company Name</label><input type="text" id="f-company" placeholder="Your Company Ltd"></div>
+    <div class="field-row"><label for="f-name">Employee Name</label><input type="text" id="f-name" placeholder="Full Name"><span class="field-error" id="err-name"></span></div>
+    <div class="field-row"><label for="f-ref">Employee Ref</label><input type="text" id="f-ref" placeholder="929"></div>
+    <div class="field-row"><label for="f-ni">NI Number</label><input type="text" id="f-ni" placeholder="AA999999A" maxlength="9"></div>
+    <div class="field-row"><label for="f-taxcode">Tax Code</label><input type="text" id="f-taxcode" value="1271T" placeholder="e.g. 1271T"></div>
+    <div class="field-row"><label for="f-dept">Department</label><input type="text" id="f-dept" placeholder="B3"></div>
+    <div class="field-row"><label for="f-period">Tax Period</label><input type="number" id="f-period" value="1" min="1" max="12"></div>
+    <div class="field-row"><label for="f-date">Process Date</label><input type="date" id="f-date"></div>
+    <div class="field-row"><label for="f-method">Payment Method</label><input type="text" id="f-method" value="Direct BACS"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Payment Lines</legend>
+    <table id="lines-table">
+      <thead><tr>
+        <th style="width:34%">Description</th>
+        <th style="width:18%;text-align:right">Units</th>
+        <th style="width:18%;text-align:right">Rate &#163;</th>
+        <th style="width:22%;text-align:right">Amount &#163;</th>
+        <th style="width:8%"></th>
+      </tr></thead>
+      <tbody id="lines-body"></tbody>
+    </table>
+    <button class="btn-add" onclick="addLine()">+ Add Payment Line</button>
+  </fieldset>
+
+  <details id="ytd-section">
+    <summary>Prior Period YTD (optional)</summary>
+    <div>
+      <p style="font-size:11px;color:#666;margin-bottom:8px;">Enter cumulative totals from previous pay periods this tax year.</p>
+      <div class="field-row"><label>YTD Gross Pay</label><input type="number" id="ytd-gross" value="0" min="0" step="0.01"></div>
+      <div class="field-row"><label>YTD PAYE Tax</label><input type="number" id="ytd-tax" value="0" min="0" step="0.01"></div>
+      <div class="field-row"><label>YTD Employee NI</label><input type="number" id="ytd-ni" value="0" min="0" step="0.01"></div>
+      <div class="field-row"><label>YTD Pension (Ee)</label><input type="number" id="ytd-pension" value="0" min="0" step="0.01"></div>
+      <div class="field-row"><label>YTD Net Pay</label><input type="number" id="ytd-net" value="0" min="0" step="0.01"></div>
+    </div>
+  </details>
+
+  <div class="btn-row">
+    <button class="btn btn-primary" onclick="calculate()">&#9654; Calculate</button>
+    <button class="btn btn-secondary" onclick="resetForm()">Reset</button>
+  </div>
+
+  <div class="disclaimer">
+    &#9432; PAYE may differ &#177;&#163;2 from payroll software due to HMRC cumulative rounding.
+    Rates: Employee NI 8%, Employer NI 15%, Pension Ee 5% / Er 3% (auto-enrolment).
+  </div>
+</div>
+
+<div id="payslip-output">
+  <div class="ps-placeholder">
+    <div class="icon">&#128196;</div>
+    <p>Fill in the form and click <strong>Calculate</strong><br>to generate your payslip.</p>
+  </div>
+</div>
+
+<script>
+const NI_PRIMARY_THRESHOLD   = 1048;
+const NI_SECONDARY_THRESHOLD = 417;
+const NI_EMPLOYEE_RATE       = 0.08;
+const NI_EMPLOYER_RATE       = 0.15;
+const PENSION_LOWER_LIMIT    = 520;
+const PENSION_EE_RATE        = 0.05;
+const PENSION_ER_RATE        = 0.03;
+const PAYE_BASIC_RATE        = 0.20;
+const PAYE_HIGHER_RATE       = 0.40;
+const BASIC_RATE_LIMIT       = 4189;
+
+let lineCount = 0;
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('f-date').value = new Date().toISOString().slice(0, 10);
+  addLine('Weekday', '', '');
+  addLine('Weekend', '', '');
+  addLine('Weekend premium', '', '');
+});
+
+function addLine(desc = '', units = '', rate = '') {
+  const tbody = document.getElementById('lines-body');
+  const id = ++lineCount;
+  const tr = document.createElement('tr');
+  tr.id = `line-${id}`;
+  tr.innerHTML = `
+    <td><input type="text" value="${esc(desc)}" placeholder="e.g. Weekday" style="width:100%"></td>
+    <td><input type="number" value="${esc(units)}" min="0" step="0.01" style="width:100%" oninput="updateLineAmount(${id})"></td>
+    <td><input type="number" value="${esc(rate)}" min="0" step="0.0001" style="width:100%" oninput="updateLineAmount(${id})"></td>
+    <td class="line-amount" id="amt-${id}">&#8212;</td>
+    <td><button class="btn-del" onclick="removeLine(${id})" title="Remove">&#215;</button></td>`;
+  tbody.appendChild(tr);
+  if (units && rate) updateLineAmount(id);
+}
+
+function removeLine(id) {
+  const tr = document.getElementById(`line-${id}`);
+  if (tr) tr.remove();
+}
+
+function updateLineAmount(id) {
+  const tr = document.getElementById(`line-${id}`);
+  if (!tr) return;
+  const inputs = tr.querySelectorAll('input[type=number]');
+  const units = parseFloat(inputs[0].value) || 0;
+  const rate  = parseFloat(inputs[1].value) || 0;
+  const amt   = r2(units * rate);
+  document.getElementById(`amt-${id}`).textContent = units && rate ? fmt(amt) : '—';
+}
+
+const r2  = v => Math.round(v * 100) / 100;
+const fmt = v => v.toFixed(2);
+const esc = s => String(s).replace(/"/g, '&quot;');
+
+function parseTaxCode(code) {
+  code = (code || '').trim().toUpperCase();
+  if (code === 'NT')  return { annualAllowance: 0, rate: 0 };
+  if (code === 'BR')  return { annualAllowance: 0, rate: PAYE_BASIC_RATE };
+  if (code === '0T')  return { annualAllowance: 0, rate: PAYE_BASIC_RATE };
+  if (code.startsWith('K')) { const n = parseInt(code.slice(1)); return { annualAllowance: -(n * 10), rate: PAYE_BASIC_RATE }; }
+  const n = parseInt(code);
+  if (!isNaN(n)) return { annualAllowance: n * 10, rate: PAYE_BASIC_RATE };
+  return { annualAllowance: 12570, rate: PAYE_BASIC_RATE };
+}
+
+function calcLines() {
+  const rows = document.querySelectorAll('#lines-body tr');
+  const lines = [];
+  let totalGross = 0;
+  rows.forEach(tr => {
+    const inputs = tr.querySelectorAll('input[type=number]');
+    const desc  = tr.querySelector('input[type=text]').value.trim();
+    const units = parseFloat(inputs[0].value) || 0;
+    const rate  = parseFloat(inputs[1].value) || 0;
+    const amt   = r2(units * rate);
+    lines.push({ desc, units, rate, amt });
+    totalGross = r2(totalGross + amt);
+  });
+  return { lines, totalGross };
+}
+
+function calcPAYE(grossForTax, taxCode) {
+  const { annualAllowance } = parseTaxCode(taxCode);
+  const monthlyAllowance = r2(annualAllowance / 12);
+  const taxableBasic = Math.max(r2(grossForTax - monthlyAllowance), 0);
+  const basicBand = Math.max(BASIC_RATE_LIMIT - monthlyAllowance, 0);
+  if (taxableBasic <= basicBand) return r2(taxableBasic * PAYE_BASIC_RATE);
+  return r2(basicBand * PAYE_BASIC_RATE + (taxableBasic - basicBand) * PAYE_HIGHER_RATE);
+}
+
+function calculate() {
+  const nameEl = document.getElementById('f-name');
+  const errName = document.getElementById('err-name');
+  if (!nameEl.value.trim()) {
+    nameEl.classList.add('error');
+    errName.textContent = 'Required';
+    nameEl.focus();
+    return;
+  }
+  nameEl.classList.remove('error');
+  errName.textContent = '';
+
+  const { lines, totalGross } = calcLines();
+  const employeePension = r2(Math.max(totalGross - PENSION_LOWER_LIMIT, 0) * PENSION_EE_RATE);
+  const grossForTax     = r2(totalGross - employeePension);
+  const taxCode         = document.getElementById('f-taxcode').value;
+  const paye            = calcPAYE(grossForTax, taxCode);
+  const employeeNI      = r2(Math.max(totalGross - NI_PRIMARY_THRESHOLD, 0) * NI_EMPLOYEE_RATE);
+  const employerNI      = r2(Math.max(totalGross - NI_SECONDARY_THRESHOLD, 0) * NI_EMPLOYER_RATE);
+  const employerPension = r2(Math.max(totalGross - PENSION_LOWER_LIMIT, 0) * PENSION_ER_RATE);
+  const netPay          = r2(totalGross - paye - employeeNI - employeePension);
+
+  const priorGross   = parseFloat(document.getElementById('ytd-gross').value)   || 0;
+  const priorTax     = parseFloat(document.getElementById('ytd-tax').value)     || 0;
+  const priorNI      = parseFloat(document.getElementById('ytd-ni').value)      || 0;
+  const priorPension = parseFloat(document.getElementById('ytd-pension').value) || 0;
+  const priorNet     = parseFloat(document.getElementById('ytd-net').value)     || 0;
+
+  const ytd = {
+    gross:   r2(priorGross   + totalGross),
+    tax:     r2(priorTax     + paye),
+    ni:      r2(priorNI      + employeeNI),
+    pension: r2(priorPension + employeePension),
+    net:     r2(priorNet     + netPay),
+  };
+
+  renderPayslip({
+    company: document.getElementById('f-company').value || 'Company Name',
+    name: nameEl.value.trim(),
+    ref: document.getElementById('f-ref').value,
+    niNum: document.getElementById('f-ni').value.toUpperCase(),
+    taxCode,
+    dept: document.getElementById('f-dept').value,
+    period: document.getElementById('f-period').value,
+    date: document.getElementById('f-date').value,
+    method: document.getElementById('f-method').value,
+    lines, totalGross, grossForTax, employeePension, paye,
+    employeeNI, employerNI, employerPension, netPay, ytd,
+  });
+}
+
+function copyYTD(ytd) {
+  document.getElementById('ytd-gross').value   = ytd.gross;
+  document.getElementById('ytd-tax').value     = ytd.tax;
+  document.getElementById('ytd-ni').value      = ytd.ni;
+  document.getElementById('ytd-pension').value = ytd.pension;
+  document.getElementById('ytd-net').value     = ytd.net;
+  document.getElementById('ytd-section').open  = true;
+  alert('YTD totals copied. Update payment lines for next month and click Calculate.');
+}
+
+function resetForm() {
+  ['f-name','f-ref','f-ni','f-dept'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('f-taxcode').value = '1271T';
+  document.getElementById('f-period').value = '1';
+  document.getElementById('f-date').value = new Date().toISOString().slice(0, 10);
+  document.getElementById('f-method').value = 'Direct BACS';
+  ['ytd-gross','ytd-tax','ytd-ni','ytd-pension','ytd-net'].forEach(id => document.getElementById(id).value = '0');
+  document.getElementById('lines-body').innerHTML = '';
+  lineCount = 0;
+  addLine('Weekday', '', '');
+  addLine('Weekend', '', '');
+  addLine('Weekend premium', '', '');
+  document.getElementById('payslip-output').innerHTML = '<div class="ps-placeholder"><div class="icon">&#128196;</div><p>Fill in the form and click <strong>Calculate</strong><br>to generate your payslip.</p></div>';
+}
+
+function renderPayslip(d) {
+  const dateStr = d.date ? new Date(d.date + 'T00:00:00').toLocaleDateString('en-GB') : '';
+  let payRows = d.lines.filter(l => l.desc || l.units || l.rate).map(l => `
+    <div class="pay-row">
+      <span>${esc(l.desc)}</span>
+      <span class="r">${l.units ? l.units.toFixed(2) : ''}</span>
+      <span class="r">${l.rate ? l.rate.toFixed(4) : ''}</span>
+      <span class="r">${l.amt ? fmt(l.amt) : ''}</span>
+    </div>`).join('');
+
+  document.getElementById('payslip-output').innerHTML = `
+    <div class="ps-header">
+      <span class="company">${esc(d.company)}</span>
+      <span class="title">Payslip</span>
+    </div>
+    <div class="ps-emp-bar">
+      <span><span class="lbl">Ref.</span><span class="val">${esc(d.ref)}</span></span>
+      <span><span class="lbl">Employee Name</span><span class="val">${esc(d.name)}</span></span>
+      <span><span class="lbl">Process Date</span><span class="val">${dateStr}</span></span>
+      <span><span class="lbl">N.I. Number</span><span class="val">${esc(d.niNum)}</span></span>
+    </div>
+    <div class="ps-meta">
+      <div class="ps-meta-cell"><div class="lbl">Dept</div><div class="val">${esc(d.dept)}</div></div>
+      <div class="ps-meta-cell"><div class="lbl">Tax Code</div><div class="val">${esc(d.taxCode)}</div></div>
+      <div class="ps-meta-cell"><div class="lbl">Tax Period</div><div class="val">${esc(d.period)}</div></div>
+      <div class="ps-meta-cell"><div class="lbl">Payment Period</div><div class="val">Monthly</div></div>
+    </div>
+    <div class="ps-body">
+      <div class="ps-col">
+        <div class="ps-col-hdr payments-hdr">
+          <span>Payments</span><span style="text-align:right">Units</span>
+          <span style="text-align:right">Rate</span><span style="text-align:right">Amount</span>
+        </div>
+        ${payRows}
+        <div class="holidays-row"><span>Holidays: Taken <strong>0.0</strong></span><span>Remaining <strong>0.0</strong></span></div>
+      </div>
+      <div class="ps-col">
+        <div class="ps-col-hdr deductions-hdr"><span>Deductions</span><span style="text-align:right">Amount</span></div>
+        <div class="ded-row"><span>PAYE Tax</span><span class="r">${fmt(d.paye)}</span></div>
+        <div class="ded-row"><span>National Insurance</span><span class="r">${fmt(d.employeeNI)}</span></div>
+        <div class="ded-row"><span>Pension</span><span class="r">${fmt(d.employeePension)}</span></div>
+      </div>
+    </div>
+    <div class="ps-summary">
+      <div class="ps-sum-col">
+        <div class="ps-sum-hdr">This Period</div>
+        <div class="sum-row"><span>Total Gross Pay</span><span class="r">${fmt(d.totalGross)}</span></div>
+        <div class="sum-row"><span>Gross for Tax</span><span class="r">${fmt(d.grossForTax)}</span></div>
+        <div class="sum-row"><span>Earnings for NI</span><span class="r">${fmt(d.totalGross)}</span></div>
+        <div class="sum-row"><span>Payment Period</span><span class="r">Monthly</span></div>
+        <div class="sum-row"><span>Employer NI</span><span class="r">${fmt(d.employerNI)}</span></div>
+        <div class="sum-row"><span>Er Pension</span><span class="r">${fmt(d.employerPension)}</span></div>
+      </div>
+      <div class="ps-sum-col">
+        <div class="ps-sum-hdr">Year to Date</div>
+        <div class="sum-row"><span>Total Gross Pay TD</span><span class="r">${fmt(d.ytd.gross)}</span></div>
+        <div class="sum-row"><span>Gross for Tax TD</span><span class="r">${fmt(r2(d.ytd.gross - d.ytd.pension))}</span></div>
+        <div class="sum-row"><span>Tax Paid TD</span><span class="r">${fmt(d.ytd.tax)}</span></div>
+        <div class="sum-row"><span>Earnings for NI TD</span><span class="r">${fmt(d.ytd.gross)}</span></div>
+        <div class="sum-row"><span>National Insurance TD</span><span class="r">${fmt(d.ytd.ni)}</span></div>
+        <div class="sum-row"><span>Ee Pension TD</span><span class="r">${fmt(d.ytd.pension)}</span></div>
+      </div>
+    </div>
+    <div class="ps-footer">
+      <div class="meta-text">
+        <span>Tax Code: <strong>${esc(d.taxCode)}</strong></span>
+        <span>Dept: <strong>${esc(d.dept)}</strong></span>
+        <span>Tax Period: <strong>${esc(d.period)}</strong></span>
+        <span>Payment Method: <strong>${esc(d.method)}</strong></span>
+      </div>
+      <div class="net-pay-box">
+        <div class="lbl">Net Pay</div>
+        <div class="val">${fmt(d.netPay)}</div>
+      </div>
+    </div>
+    <button id="print-btn" onclick="window.print()">&#128438; Print / Save as PDF</button>
+    <button id="copy-ytd-btn" style="display:block;margin:0 16px 12px;padding:6px 14px;background:#d0e0f4;color:#1a3a6c;border:1px solid #b0c4de;border-radius:5px;cursor:pointer;font-size:12px;font-weight:600;" onclick="copyYTD(window._lastYTD)">↻ Copy YTD → Prior Period (for next month)</button>`;
+
+  window._lastYTD = d.ytd;
+}
+</script>
+</body>
+</html>
