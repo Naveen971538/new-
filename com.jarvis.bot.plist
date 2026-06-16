@@ -8,7 +8,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/python3</string>
+        <string>/usr/local/bin/python3.9</string>
         <string>/Users/YOUR_USERNAME/jarvis/jarvis.py</string>
     </array>
 
