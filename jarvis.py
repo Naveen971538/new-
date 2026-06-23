@@ -1,78 +1,289 @@
 #!/usr/bin/env python3
 """
-JARVIS — Self-Evolving Personal AI Companion (iMessage Edition)
-Runs on macOS. Reads iMessages via chat.db, replies via AppleScript.
+JARVIS — Self-Evolving Personal AI Companion (iMessage + Cerebras Edition)
+
+Runs on macOS. Reads your iMessages from the Messages SQLite database,
+replies via AppleScript, and is powered by the Cerebras inference API
+(OpenAI-compatible, fast, free tier).
+
+Features
+--------
+Core
+  * iMessage in/out (reads ~/Library/Messages/chat.db, sends via osascript)
+  * Cerebras LLM brain with function/tool calling
+  * Persistent SQLite memory (facts, tasks, goals, chat history, insights)
+  * Auto-wakes the Mac's display when a message arrives (caffeinate)
+
+Easy wins
+  * Location-aware morning briefing (IP geolocation + weather)
+  * Voice replies via the macOS `say` command (toggle with /voice)
+  * Screenshot on demand (/screenshot) sent back over iMessage
+  * Clipboard bridge (/clipboard to read, /copy to write)
+
+Productivity
+  * Calendar integration (add/list events in Calendar.app)
+  * Reminders.app sync (push tasks to Apple Reminders)
+  * Mail summariser (summarise unread mail in Mail.app)
+  * Web search tool (free, no API key) so answers use live data
+
+Self-evolving
+  * Self-evolve job derives new insights about you every few hours
+  * Weekly self-review ("what I learned about you this week")
+  * Sentiment tracking of your messages over time
+  * Proactive nudges for tasks left undone
+
+Reliability
+  * Crash auto-recovery loop + iMessage crash alert
+  * /status health check (uptime, last poll, DB size, counts)
+
+Setup (.env in ~/jarvis/.env)
+  CEREBRAS_API_KEY=csk-...          # from https://cloud.cerebras.ai
+  MY_IMESSAGE_ID=+447823753000      # the number/Apple-ID you text FROM
+  # optional:
+  CEREBRAS_MODEL=llama-3.3-70b
 """
 
-import asyncio
 import json
 import logging
 import os
 import sqlite3
 import subprocess
+import sys
+import threading
 import time
-from datetime import date, datetime
+import traceback
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import List, Optional, Tuple
 
-import google.generativeai as genai
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
+from openai import OpenAI
 
-load_dotenv()
+# ── Configuration ──────────────────────────────────────────────────────────────
 
-GEMINI_KEY    = os.environ["GEMINI_API_KEY"]
-MY_IMESSAGE_ID = os.environ["MY_IMESSAGE_ID"]   # e.g. +919876543210 or your@email.com
-DB_PATH       = os.environ.get("DB_PATH", str(Path.home() / "jarvis/jarvis.db"))
-MESSAGES_DB   = str(Path.home() / "Library/Messages/chat.db")
-POLL_INTERVAL = 2   # seconds between message checks
+load_dotenv(Path.home() / "jarvis" / ".env")
+load_dotenv()  # also pick up a .env in the current directory if present
 
-genai.configure(api_key=GEMINI_KEY)
-scheduler = AsyncIOScheduler()
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+MY_IMESSAGE_ID = os.environ.get("MY_IMESSAGE_ID", "")
+CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
+CEREBRAS_BASE_URL = os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
+
+JARVIS_DIR = Path.home() / "jarvis"
+DB_PATH = os.environ.get("DB_PATH", str(JARVIS_DIR / "jarvis.db"))
+MESSAGES_DB = str(Path.home() / "Library" / "Messages" / "chat.db")
+POLL_INTERVAL = 2          # seconds between iMessage checks
+HISTORY_TURNS = 16         # how many past messages to feed the model
+MAX_TOOL_HOPS = 6          # safety cap on tool-call loops
+HTTP_TIMEOUT = 12          # seconds for outbound web requests
+
+JARVIS_DIR.mkdir(parents=True, exist_ok=True)
+
+if not CEREBRAS_API_KEY or not MY_IMESSAGE_ID:
+    sys.stderr.write(
+        "ERROR: CEREBRAS_API_KEY and MY_IMESSAGE_ID must be set in ~/jarvis/.env\n"
+    )
+    sys.exit(1)
+
+client = OpenAI(api_key=CEREBRAS_API_KEY, base_url=CEREBRAS_BASE_URL)
+scheduler = BackgroundScheduler()
+START_TIME = time.time()
+_last_poll_ts = START_TIME
+_send_lock = threading.Lock()   # serialise AppleScript sends across threads
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler(str(Path.home() / "jarvis/jarvis.log")),
+        logging.FileHandler(str(JARVIS_DIR / "jarvis.log")),
         logging.StreamHandler(),
     ],
 )
 log = logging.getLogger("JARVIS")
 
 
-# ── iMessage Send/Receive ─────────────────────────────────────────────────────
+# ── Database ────────────────────────────────────────────────────────────────────
 
-def send_imessage(text: str):
-    safe = text.replace("\\", "\\\\").replace('"', '\\"')
-    script = f'''
-tell application "Messages"
-    set svc to 1st service whose service type is iMessage
-    set bdy to buddy "{MY_IMESSAGE_ID}" of svc
-    send "{safe}" to bdy
-end tell
-'''
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    if result.returncode != 0:
-        log.error("iMessage send failed: %s", result.stderr.strip())
+def db():
+    """A fresh connection (safe to use from scheduler threads)."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, fact TEXT);
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, text TEXT, done INTEGER DEFAULT 0, done_ts TEXT);
+            CREATE TABLE IF NOT EXISTS goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, text TEXT, done INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS daily_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT, summary TEXT);
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, role TEXT, content TEXT);
+            CREATE TABLE IF NOT EXISTS insights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, insight TEXT);
+            CREATE TABLE IF NOT EXISTS evolution_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, note TEXT);
+            CREATE TABLE IF NOT EXISTS sentiment_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, message TEXT, mood TEXT, score REAL);
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY, value TEXT);
+            """
+        )
+        c.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    with db() as c:
+        c.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        c.commit()
 
 
 def get_last_rowid() -> int:
+    with db() as c:
+        row = c.execute("SELECT value FROM state WHERE key='last_rowid'").fetchone()
+        return int(row["value"]) if row else 0
+
+
+def set_last_rowid(rowid: int):
+    with db() as c:
+        c.execute(
+            "INSERT INTO state(key,value) VALUES('last_rowid',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(rowid),),
+        )
+        c.commit()
+
+
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ── macOS helpers (all escaping-safe via osascript argv) ────────────────────────
+
+def run_osascript(script: str, *args: str) -> subprocess.CompletedProcess:
+    """Run an AppleScript. Extra args are passed to the script's `on run argv`
+    handler, which sidesteps every quoting/escaping headache."""
+    return subprocess.run(
+        ["osascript", "-e", script, *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+_SEND_TEXT_SCRIPT = """
+on run {targetId, msgText}
+    tell application "Messages"
+        set targetService to 1st service whose service type = iMessage
+        set targetBuddy to buddy targetId of targetService
+        send msgText to targetBuddy
+    end tell
+end run
+"""
+
+_SEND_FILE_SCRIPT = """
+on run {targetId, filePath}
+    tell application "Messages"
+        set targetService to 1st service whose service type = iMessage
+        set targetBuddy to buddy targetId of targetService
+        send (POSIX file filePath) to targetBuddy
+    end tell
+end run
+"""
+
+
+def send_imessage(text: str):
+    if not text:
+        return
+    with _send_lock:
+        for chunk in _split(text, 1800):
+            res = run_osascript(_SEND_TEXT_SCRIPT, MY_IMESSAGE_ID, chunk)
+            if res.returncode != 0:
+                log.error("send_imessage failed: %s", res.stderr.strip())
+            time.sleep(0.3)
+
+
+def send_imessage_file(path: str):
+    with _send_lock:
+        res = run_osascript(_SEND_FILE_SCRIPT, MY_IMESSAGE_ID, path)
+        if res.returncode != 0:
+            log.error("send_imessage_file failed: %s", res.stderr.strip())
+
+
+def _split(text: str, size: int) -> List[str]:
+    return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
+
+def wake_screen():
+    """Wake the display + reset the idle-sleep timer so messages are seen
+    even when the screen is off. `-u` simulates user activity; `-t` keeps it
+    awake briefly so the wake actually registers."""
     try:
-        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True)
-        row = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM message").fetchone()
-        conn.close()
-        return row[0]
+        subprocess.Popen(["caffeinate", "-u", "-t", "5"])
     except Exception as e:
-        log.error("chat.db read error: %s", e)
-        return 0
+        log.warning("wake_screen failed: %s", e)
 
 
-def poll_new_messages(since_rowid: int) -> list[tuple[int, str]]:
-    """Return list of (rowid, text) for new incoming messages from MY_IMESSAGE_ID."""
+def speak(text: str):
     try:
-        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True)
-        rows = conn.execute("""
-            SELECT m.rowid, m.text
+        subprocess.Popen(["say", text])
+    except Exception as e:
+        log.warning("speak failed: %s", e)
+
+
+def take_screenshot() -> str:
+    path = str(JARVIS_DIR / "screenshot.png")
+    subprocess.run(["screencapture", "-x", path], timeout=20)
+    return path
+
+
+def clipboard_read() -> str:
+    res = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=10)
+    return res.stdout
+
+
+def clipboard_write(text: str):
+    subprocess.run(["pbcopy"], input=text, text=True, timeout=10)
+
+
+# ── iMessage polling ────────────────────────────────────────────────────────────
+
+def poll_new_messages(since_rowid: int) -> List[Tuple[int, str]]:
+    """Return [(rowid, text)] of incoming texts newer than since_rowid."""
+    try:
+        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)
+        rows = conn.execute(
+            """
+            SELECT m.rowid AS rid, m.text AS body
             FROM   message m
             JOIN   handle  h ON m.handle_id = h.rowid
             WHERE  m.rowid > ?
@@ -80,544 +291,777 @@ def poll_new_messages(since_rowid: int) -> list[tuple[int, str]]:
               AND  m.text IS NOT NULL
               AND  h.id = ?
             ORDER  BY m.rowid
-        """, (since_rowid, MY_IMESSAGE_ID)).fetchall()
+            """,
+            (since_rowid, MY_IMESSAGE_ID),
+        ).fetchall()
         conn.close()
-        return rows
+        return [(r[0], r[1]) for r in rows]
+    except sqlite3.OperationalError as e:
+        # Almost always "unable to open database file" = no Full Disk Access.
+        log.error("Cannot read chat.db (%s). Grant Terminal Full Disk Access.", e)
+        return []
+
+
+def newest_rowid() -> int:
+    try:
+        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)
+        row = conn.execute("SELECT MAX(rowid) FROM message").fetchone()
+        conn.close()
+        return int(row[0]) if row and row[0] else 0
+    except Exception:
+        return 0
+
+
+# ── Outbound web helpers (stdlib only, no API keys) ─────────────────────────────
+
+def _http_get(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "JARVIS/1.0"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def get_location() -> dict:
+    """Best-effort city/region/country via free IP geolocation."""
+    try:
+        data = json.loads(_http_get("http://ip-api.com/json/"))
+        if data.get("status") == "success":
+            return {
+                "city": data.get("city", ""),
+                "region": data.get("regionName", ""),
+                "country": data.get("country", ""),
+            }
     except Exception as e:
-        log.error("poll error: %s", e)
-        return []
+        log.warning("get_location failed: %s", e)
+    return {}
 
 
-# ── JARVIS SQLite Database ────────────────────────────────────────────────────
-
-def _db():
-    return sqlite3.connect(DB_PATH)
-
-
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with _db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS memories (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            at    TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS tasks (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            title      TEXT NOT NULL,
-            priority   TEXT DEFAULT 'medium',
-            status     TEXT DEFAULT 'pending',
-            due_date   TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            done_at    TEXT
-        );
-        CREATE TABLE IF NOT EXISTS daily_logs (
-            id    INTEGER PRIMARY KEY AUTOINCREMENT,
-            date  TEXT NOT NULL,
-            entry TEXT NOT NULL,
-            mood  TEXT,
-            at    TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            role    TEXT NOT NULL,
-            content TEXT NOT NULL,
-            at      TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS insights (
-            key        TEXT PRIMARY KEY,
-            insight    TEXT NOT NULL,
-            confidence TEXT DEFAULT 'medium',
-            at         TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS goals (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            title      TEXT NOT NULL,
-            why        TEXT,
-            status     TEXT DEFAULT 'active',
-            progress   TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS evolution_log (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            summary TEXT NOT NULL,
-            at      TEXT DEFAULT (datetime('now'))
-        );
-        """)
-    log.info("Database ready: %s", DB_PATH)
+def get_weather(location: str = "") -> str:
+    """One-line weather from wttr.in (free, no key)."""
+    try:
+        if not location:
+            loc = get_location()
+            location = loc.get("city", "")
+        q = urllib.parse.quote(location)
+        return _http_get(f"https://wttr.in/{q}?format=%l:+%c+%t,+feels+%f,+%h+humidity").strip()
+    except Exception as e:
+        return f"(weather unavailable: {e})"
 
 
-# ── Data helpers ──────────────────────────────────────────────────────────────
-
-def mem_all() -> dict:
-    with _db() as c:
-        return {k: v for k, v in c.execute("SELECT key, value FROM memories").fetchall()}
-
-def mem_set(key: str, value: str):
-    with _db() as c:
-        c.execute("INSERT OR REPLACE INTO memories (key, value, at) VALUES (?, ?, datetime('now'))", (key, value))
-
-def tasks_get() -> list:
-    with _db() as c:
-        rows = c.execute("""
-            SELECT id, title, priority, due_date FROM tasks
-            WHERE status = 'pending'
-            ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id
-        """).fetchall()
-    return [{"id": r[0], "title": r[1], "priority": r[2], "due": r[3]} for r in rows]
-
-def task_add(title: str, priority: str = "medium", due_date: str = None) -> int:
-    with _db() as c:
-        return c.execute("INSERT INTO tasks (title, priority, due_date) VALUES (?, ?, ?)",
-                         (title, priority, due_date)).lastrowid
-
-def task_complete(task_id: int):
-    with _db() as c:
-        c.execute("UPDATE tasks SET status='completed', done_at=datetime('now') WHERE id=?", (task_id,))
-
-def log_add(entry: str, mood: str = None):
-    with _db() as c:
-        c.execute("INSERT INTO daily_logs (date, entry, mood) VALUES (?, ?, ?)",
-                  (date.today().isoformat(), entry, mood))
-
-def today_logs() -> list:
-    with _db() as c:
-        return c.execute("SELECT entry, mood FROM daily_logs WHERE date=? ORDER BY at",
-                         (date.today().isoformat(),)).fetchall()
-
-def recent_logs(days: int = 7) -> list:
-    with _db() as c:
-        return c.execute("SELECT date, entry, mood FROM daily_logs WHERE date >= date('now', ?) ORDER BY at DESC",
-                         (f"-{days} days",)).fetchall()
-
-def insights_all() -> dict:
-    with _db() as c:
-        return {k: {"insight": i, "confidence": conf}
-                for k, i, conf in c.execute("SELECT key, insight, confidence FROM insights ORDER BY at DESC").fetchall()}
-
-def insight_set(key: str, insight: str, confidence: str = "medium"):
-    with _db() as c:
-        c.execute("INSERT OR REPLACE INTO insights (key, insight, confidence, at) VALUES (?, ?, ?, datetime('now'))",
-                  (key, insight, confidence))
-
-def goals_get(status: str = "active") -> list:
-    with _db() as c:
-        rows = c.execute("SELECT id, title, why, progress FROM goals WHERE status=? ORDER BY id", (status,)).fetchall()
-    return [{"id": r[0], "title": r[1], "why": r[2], "progress": r[3]} for r in rows]
-
-def goal_add(title: str, why: str = None) -> int:
-    with _db() as c:
-        return c.execute("INSERT INTO goals (title, why) VALUES (?, ?)", (title, why)).lastrowid
-
-def goal_update(goal_id: int, progress: str):
-    with _db() as c:
-        c.execute("UPDATE goals SET progress=?, updated_at=datetime('now') WHERE id=?", (progress, goal_id))
-
-def evolution_log_add(summary: str):
-    with _db() as c:
-        c.execute("INSERT INTO evolution_log (summary) VALUES (?)", (summary,))
-
-def history_save(role: str, content: str):
-    with _db() as c:
-        c.execute("INSERT INTO chat_history (role, content) VALUES (?, ?)", (role, content))
-
-def history_load_gemini(n: int = 40) -> list:
-    with _db() as c:
-        rows = c.execute("SELECT role, content FROM chat_history ORDER BY id DESC LIMIT ?", (n,)).fetchall()
-    messages = [{"role": "model" if r[0] == "assistant" else "user", "parts": [r[1]]} for r in reversed(rows)]
-    if not messages:
-        return []
-    clean = [messages[0]]
-    for msg in messages[1:]:
-        if msg["role"] != clean[-1]["role"]:
-            clean.append(msg)
-    while clean and clean[0]["role"] != "user":
-        clean.pop(0)
-    if clean and clean[-1]["role"] == "user":
-        clean.pop()
-    return clean
-
-def recent_history_text(n: int = 60) -> str:
-    with _db() as c:
-        rows = c.execute("SELECT role, content, at FROM chat_history ORDER BY id DESC LIMIT ?", (n,)).fetchall()
-    return "\n".join(f"[{r[2]}] {r[0].upper()}: {r[1][:300]}" for r in reversed(rows))
+def web_search(query: str) -> str:
+    """Free, key-less search via DuckDuckGo's Instant Answer API. Returns a
+    short text summary; good for facts/definitions, limited for breaking news."""
+    try:
+        q = urllib.parse.quote(query)
+        data = json.loads(
+            _http_get(f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1")
+        )
+        parts = []
+        if data.get("AbstractText"):
+            parts.append(data["AbstractText"])
+        if data.get("Answer"):
+            parts.append(data["Answer"])
+        for t in data.get("RelatedTopics", [])[:5]:
+            if isinstance(t, dict) and t.get("Text"):
+                parts.append("• " + t["Text"])
+        return "\n".join(parts) if parts else "No direct result found."
+    except Exception as e:
+        return f"(search unavailable: {e})"
 
 
-# ── Gemini Tools ──────────────────────────────────────────────────────────────
+# ── Calendar / Reminders / Mail (AppleScript) ───────────────────────────────────
 
-TOOL_DECLARATIONS = [{
-    "function_declarations": [
-        {"name": "remember",
-         "description": "Permanently store an important fact about the user.",
-         "parameters": {"type": "object", "properties": {
-             "key":   {"type": "string"},
-             "value": {"type": "string"}}, "required": ["key", "value"]}},
-        {"name": "update_insight",
-         "description": "Store a behavioural pattern or insight about the user.",
-         "parameters": {"type": "object", "properties": {
-             "key":        {"type": "string"},
-             "insight":    {"type": "string"},
-             "confidence": {"type": "string", "enum": ["low", "medium", "high"]}},
-             "required": ["key", "insight"]}},
-        {"name": "add_task",
-         "description": "Add a task to the user's list.",
-         "parameters": {"type": "object", "properties": {
-             "title":    {"type": "string"},
-             "priority": {"type": "string", "enum": ["high", "medium", "low"]},
-             "due_date": {"type": "string"}}, "required": ["title"]}},
-        {"name": "get_tasks",
-         "description": "Get all pending tasks.",
-         "parameters": {"type": "object", "properties": {}}},
-        {"name": "complete_task",
-         "description": "Mark a task as completed.",
-         "parameters": {"type": "object", "properties": {
-             "task_id": {"type": "integer"}}, "required": ["task_id"]}},
-        {"name": "set_goal",
-         "description": "Set a long-term goal.",
-         "parameters": {"type": "object", "properties": {
-             "title": {"type": "string"},
-             "why":   {"type": "string"}}, "required": ["title"]}},
-        {"name": "get_goals",
-         "description": "Get active long-term goals.",
-         "parameters": {"type": "object", "properties": {}}},
-        {"name": "update_goal_progress",
-         "description": "Update progress on a goal.",
-         "parameters": {"type": "object", "properties": {
-             "goal_id":  {"type": "integer"},
-             "progress": {"type": "string"}}, "required": ["goal_id", "progress"]}},
-        {"name": "log_activity",
-         "description": "Log what the user has been doing today.",
-         "parameters": {"type": "object", "properties": {
-             "entry": {"type": "string"},
-             "mood":  {"type": "string"}}, "required": ["entry"]}},
-        {"name": "get_today_summary",
-         "description": "Get today's activity log and pending tasks.",
-         "parameters": {"type": "object", "properties": {}}},
-        {"name": "get_week_summary",
-         "description": "Get last 7 days of logs and completed tasks.",
-         "parameters": {"type": "object", "properties": {}}},
-        {"name": "create_plan",
-         "description": "Create a structured plan.",
-         "parameters": {"type": "object", "properties": {
-             "topic":     {"type": "string"},
-             "timeframe": {"type": "string"}}, "required": ["topic"]}},
-    ]
-}]
+_CAL_ADD = """
+on run {calName, evtTitle, y, mo, d, h, mi, durMin}
+    set s to current date
+    set year of s to (y as integer)
+    set month of s to (mo as integer)
+    set day of s to (d as integer)
+    set hours of s to (h as integer)
+    set minutes of s to (mi as integer)
+    set seconds of s to 0
+    set e to s + ((durMin as integer) * minutes)
+    tell application "Calendar"
+        tell calendar calName
+            make new event with properties {summary:evtTitle, start date:s, end date:e}
+        end tell
+    end tell
+    return "ok"
+end run
+"""
 
+_CAL_LIST = """
+on run {whichDay}
+    set out to ""
+    set startD to current date
+    set hours of startD to 0
+    set minutes of startD to 0
+    set seconds of startD to 0
+    if whichDay is "tomorrow" then set startD to startD + (1 * days)
+    set endD to startD + (1 * days)
+    tell application "Calendar"
+        repeat with cal in calendars
+            set evs to (every event of cal whose start date is greater than or equal to startD and start date is less than endD)
+            repeat with ev in evs
+                set out to out & (summary of ev) & " @ " & (time string of (start date of ev)) & linefeed
+            end repeat
+        end repeat
+    end tell
+    return out
+end run
+"""
 
-def run_tool(name: str, inp: dict) -> str:
-    if name == "remember":
-        mem_set(inp["key"], inp["value"])
-        return f"Stored: {inp['key']} = {inp['value']}"
-    elif name == "update_insight":
-        insight_set(inp["key"], inp["insight"], inp.get("confidence", "medium"))
-        return f"Insight saved: {inp['key']}"
-    elif name == "add_task":
-        tid = task_add(inp["title"], inp.get("priority", "medium"), inp.get("due_date"))
-        return f"Task #{tid} added: {inp['title']}"
-    elif name == "get_tasks":
-        tasks = tasks_get()
-        return json.dumps(tasks, indent=2) if tasks else "No pending tasks."
-    elif name == "complete_task":
-        task_complete(int(inp["task_id"]))
-        return f"Task #{inp['task_id']} completed."
-    elif name == "set_goal":
-        gid = goal_add(inp["title"], inp.get("why"))
-        return f"Goal #{gid} set: {inp['title']}"
-    elif name == "get_goals":
-        goals = goals_get()
-        return json.dumps(goals, indent=2) if goals else "No active goals yet."
-    elif name == "update_goal_progress":
-        goal_update(int(inp["goal_id"]), inp["progress"])
-        return f"Goal #{inp['goal_id']} progress updated."
-    elif name == "log_activity":
-        log_add(inp["entry"], inp.get("mood"))
-        return "Logged."
-    elif name == "get_today_summary":
-        return json.dumps({"today": date.today().isoformat(),
-                           "activities": [{"entry": l[0], "mood": l[1]} for l in today_logs()],
-                           "pending_tasks": tasks_get()}, indent=2)
-    elif name == "get_week_summary":
-        with _db() as c:
-            done = c.execute("SELECT title, done_at FROM tasks WHERE status='completed' AND done_at >= datetime('now', '-7 days')").fetchall()
-        return json.dumps({"week_logs": [{"date": l[0], "entry": l[1], "mood": l[2]} for l in recent_logs(7)],
-                           "completed_tasks": [{"title": d[0], "done_at": d[1]} for d in done]}, indent=2)
-    elif name == "create_plan":
-        return json.dumps({"topic": inp["topic"], "timeframe": inp.get("timeframe", "this week"),
-                           "user_facts": mem_all(), "goals": goals_get(),
-                           "current_tasks": tasks_get(),
-                           "known_patterns": {k: v["insight"] for k, v in insights_all().items()}}, indent=2)
-    return f"Unknown tool: {name}"
+_REMINDER_ADD = """
+on run {rmTitle}
+    tell application "Reminders"
+        make new reminder with properties {name:rmTitle}
+    end tell
+    return "ok"
+end run
+"""
+
+_MAIL_UNREAD = """
+on run {maxN}
+    tell application "Mail"
+        set msgs to (messages of inbox whose read status is false)
+        set total to count of msgs
+        set lim to (maxN as integer)
+        set out to ("Unread: " & total & linefeed)
+        repeat with i from 1 to total
+            if i > lim then exit repeat
+            set m to item i of msgs
+            set out to out & "• " & (subject of m) & " — " & (sender of m) & linefeed
+        end repeat
+        return out
+    end tell
+end run
+"""
 
 
-# ── System Prompt ─────────────────────────────────────────────────────────────
-
-def build_system() -> str:
-    mem = mem_all()
-    tasks = tasks_get()
-    goals = goals_get()
-    insights = insights_all()
-    now = datetime.now().strftime("%A, %d %B %Y — %H:%M")
-
-    mem_text = "\n".join(f"  • {k}: {v}" for k, v in mem.items()) if mem else "  (still learning about you)"
-    task_text = "\n".join(
-        f"  {'🔴' if t['priority']=='high' else '🟡' if t['priority']=='medium' else '🟢'} #{t['id']} {t['title']}"
-        + (f" — due {t['due']}" if t["due"] else "")
-        for t in tasks[:10]
-    ) if tasks else "  (none pending)"
-    goal_text = "\n".join(
-        f"  🎯 #{g['id']} {g['title']}"
-        + (f"\n     Why: {g['why']}" if g["why"] else "")
-        + (f"\n     Progress: {g['progress']}" if g["progress"] else "")
-        for g in goals
-    ) if goals else "  (no goals yet)"
-    insight_text = "\n".join(
-        f"  [{v['confidence']}] {k}: {v['insight']}" for k, v in insights.items()
-    ) if insights else "  (still observing)"
-
-    return f"""You are JARVIS — a self-evolving personal AI companion on macOS, chatting via iMessage.
-
-Right now: {now}
-
-WHAT I KNOW ABOUT YOU:
-{mem_text}
-
-YOUR GOALS:
-{goal_text}
-
-PENDING TASKS:
-{task_text}
-
-MY INSIGHTS ABOUT YOU:
-{insight_text}
-
-HOW YOU OPERATE:
-• Short, phone-friendly replies. No walls of text.
-• USE your tools — actually call remember(), log_activity(), update_insight() etc.
-• Proactively plan, connect tasks to goals, notice patterns.
-• Warm, direct, honest companion.
-• Evolves every 6 hours by analysing patterns.
-
-Commands you understand (user can type these):
-  /tasks — list pending tasks
-  /goals — list goals
-  /done <id> — complete a task
-  /morning — morning briefing
-  /evening — evening check-in
-  /plan <topic> — create a plan
-  /insights — show what you've learned
-  /evolve — run self-evolution now
-  /help — show commands"""
+def add_calendar_event(title: str, when_iso: str, duration_min: int = 60,
+                       calendar_name: str = "") -> str:
+    """when_iso: 'YYYY-MM-DD HH:MM'."""
+    try:
+        dt = datetime.strptime(when_iso.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return "Bad date. Use 'YYYY-MM-DD HH:MM'."
+    cal = calendar_name or get_setting("calendar_name", "Calendar")
+    res = run_osascript(
+        _CAL_ADD, cal, title,
+        str(dt.year), str(dt.month), str(dt.day), str(dt.hour), str(dt.minute),
+        str(int(duration_min)),
+    )
+    if res.returncode != 0:
+        return f"Couldn't add event (calendar '{cal}'?): {res.stderr.strip()}"
+    return f"Added '{title}' on {when_iso}."
 
 
-# ── Gemini Chat Engine ────────────────────────────────────────────────────────
+def list_calendar_events(which_day: str = "today") -> str:
+    res = run_osascript(_CAL_LIST, which_day)
+    if res.returncode != 0:
+        return f"(calendar unavailable: {res.stderr.strip()})"
+    return res.stdout.strip() or f"No events {which_day}."
 
-def _make_model(system: str):
-    return genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=system,
-        tools=TOOL_DECLARATIONS,
-        generation_config=genai.GenerationConfig(temperature=0.8, max_output_tokens=1024),
+
+def add_reminder(text: str) -> str:
+    res = run_osascript(_REMINDER_ADD, text)
+    if res.returncode != 0:
+        return f"(reminder failed: {res.stderr.strip()})"
+    return f"Reminder added: {text}"
+
+
+def summarize_mail(max_n: int = 10) -> str:
+    res = run_osascript(_MAIL_UNREAD, str(max_n))
+    if res.returncode != 0:
+        return "(Mail app must be open/configured to read mail.)"
+    return res.stdout.strip() or "No unread mail."
+
+
+# ── Memory helpers ──────────────────────────────────────────────────────────────
+
+def remember(fact: str) -> str:
+    with db() as c:
+        c.execute("INSERT INTO memories(ts,fact) VALUES(?,?)", (now(), fact))
+        c.commit()
+    return f"Noted: {fact}"
+
+
+def recall(query: str = "") -> str:
+    with db() as c:
+        if query:
+            rows = c.execute(
+                "SELECT fact FROM memories WHERE fact LIKE ? ORDER BY id DESC LIMIT 15",
+                (f"%{query}%",),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT fact FROM memories ORDER BY id DESC LIMIT 15"
+            ).fetchall()
+    return "\n".join("• " + r["fact"] for r in rows) or "I don't recall anything on that."
+
+
+def add_task(text: str) -> str:
+    with db() as c:
+        c.execute("INSERT INTO tasks(ts,text) VALUES(?,?)", (now(), text))
+        c.commit()
+    return f"Task added: {text}"
+
+
+def list_tasks(include_done: bool = False) -> str:
+    with db() as c:
+        if include_done:
+            rows = c.execute("SELECT id,text,done FROM tasks ORDER BY id").fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id,text,done FROM tasks WHERE done=0 ORDER BY id"
+            ).fetchall()
+    if not rows:
+        return "No tasks. 🎉"
+    return "\n".join(
+        f"{r['id']}. [{'x' if r['done'] else ' '}] {r['text']}" for r in rows
     )
 
 
-def _run_chat(user_msg: str, system: str, history: list) -> str:
-    model = _make_model(system)
-    session = model.start_chat(history=history)
-    response = session.send_message(user_msg)
-    for _ in range(10):
-        fn_parts = [p for p in response.parts if hasattr(p, "function_call") and p.function_call.name]
-        if not fn_parts:
-            return response.text
-        fn_responses = []
-        for part in fn_parts:
-            fc = part.function_call
-            result = run_tool(fc.name, dict(fc.args))
-            log.info("Tool: %s → %s", fc.name, result[:80])
-            fn_responses.append(genai.protos.Part(
-                function_response=genai.protos.FunctionResponse(name=fc.name, response={"result": result})
-            ))
-        response = session.send_message(fn_responses)
-    return response.text
+def complete_task(task_id: int) -> str:
+    with db() as c:
+        cur = c.execute(
+            "UPDATE tasks SET done=1, done_ts=? WHERE id=?", (now(), task_id)
+        )
+        c.commit()
+    return f"Task {task_id} done. ✅" if cur.rowcount else f"No task #{task_id}."
 
 
-async def chat(user_msg: str) -> str:
-    history_save("user", user_msg)
-    reply = await asyncio.to_thread(_run_chat, user_msg, build_system(), history_load_gemini(40))
-    history_save("assistant", reply)
+def add_goal(text: str) -> str:
+    with db() as c:
+        c.execute("INSERT INTO goals(ts,text) VALUES(?,?)", (now(), text))
+        c.commit()
+    return f"Goal added: {text}"
+
+
+def list_goals() -> str:
+    with db() as c:
+        rows = c.execute("SELECT id,text FROM goals WHERE done=0 ORDER BY id").fetchall()
+    return "\n".join(f"{r['id']}. {r['text']}" for r in rows) or "No goals set yet."
+
+
+def log_chat(role: str, content: str):
+    with db() as c:
+        c.execute(
+            "INSERT INTO chat_history(ts,role,content) VALUES(?,?,?)",
+            (now(), role, content),
+        )
+        c.commit()
+
+
+def recent_history(limit: int = HISTORY_TURNS) -> List[dict]:
+    with db() as c:
+        rows = c.execute(
+            "SELECT role,content FROM chat_history ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+# ── Sentiment tracking (lightweight heuristic) ──────────────────────────────────
+
+_POS = {"good", "great", "happy", "awesome", "love", "excited", "thanks",
+        "amazing", "win", "done", "yay", "nice", "glad", "excellent"}
+_NEG = {"tired", "sad", "angry", "stressed", "anxious", "bad", "hate",
+        "exhausted", "worried", "depressed", "lonely", "sick", "frustrated",
+        "annoyed", "upset", "cant", "can't", "fail", "failed"}
+
+
+def track_sentiment(message: str):
+    words = {w.strip(".,!?").lower() for w in message.split()}
+    pos = len(words & _POS)
+    neg = len(words & _NEG)
+    score = pos - neg
+    mood = "positive" if score > 0 else "negative" if score < 0 else "neutral"
+    with db() as c:
+        c.execute(
+            "INSERT INTO sentiment_log(ts,message,mood,score) VALUES(?,?,?,?)",
+            (now(), message[:300], mood, float(score)),
+        )
+        c.commit()
+
+
+# ── LLM tool definitions ────────────────────────────────────────────────────────
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "remember", "description": "Save a durable fact about the user.",
+        "parameters": {"type": "object", "properties": {
+            "fact": {"type": "string"}}, "required": ["fact"]}}},
+    {"type": "function", "function": {
+        "name": "recall", "description": "Search saved facts about the user.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "add_task", "description": "Add a to-do task.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "list_tasks", "description": "List open tasks.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "complete_task", "description": "Mark a task done by id.",
+        "parameters": {"type": "object", "properties": {
+            "task_id": {"type": "integer"}}, "required": ["task_id"]}}},
+    {"type": "function", "function": {
+        "name": "add_goal", "description": "Add a longer-term goal.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "list_goals", "description": "List active goals.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "web_search", "description": "Search the web for live facts.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "get_weather", "description": "Current weather; blank = here.",
+        "parameters": {"type": "object", "properties": {
+            "location": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "add_calendar_event",
+        "description": "Add a Calendar.app event. when_iso='YYYY-MM-DD HH:MM'.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "when_iso": {"type": "string"},
+            "duration_min": {"type": "integer"}},
+            "required": ["title", "when_iso"]}}},
+    {"type": "function", "function": {
+        "name": "list_calendar_events",
+        "description": "List events; which_day 'today' or 'tomorrow'.",
+        "parameters": {"type": "object", "properties": {
+            "which_day": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "add_reminder", "description": "Add an Apple Reminders reminder.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "summarize_mail", "description": "Summarise unread Mail.app mail.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "take_screenshot",
+        "description": "Capture the Mac screen and send it to the user.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "get_clipboard", "description": "Read the Mac clipboard.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "set_clipboard", "description": "Write text to the Mac clipboard.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "speak_aloud", "description": "Say text out loud on the Mac.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+]
+
+
+def _tool_screenshot() -> str:
+    path = take_screenshot()
+    send_imessage_file(path)
+    return "Screenshot captured and sent."
+
+
+def _tool_get_clipboard() -> str:
+    return clipboard_read() or "(clipboard empty)"
+
+
+def _tool_set_clipboard(text: str) -> str:
+    clipboard_write(text)
+    return "Copied to clipboard."
+
+
+def _tool_speak(text: str) -> str:
+    speak(text)
+    return "Spoken."
+
+
+TOOL_DISPATCH = {
+    "remember": remember,
+    "recall": recall,
+    "add_task": add_task,
+    "list_tasks": lambda: list_tasks(False),
+    "complete_task": complete_task,
+    "add_goal": add_goal,
+    "list_goals": list_goals,
+    "web_search": web_search,
+    "get_weather": get_weather,
+    "add_calendar_event": add_calendar_event,
+    "list_calendar_events": list_calendar_events,
+    "add_reminder": add_reminder,
+    "summarize_mail": lambda: summarize_mail(10),
+    "take_screenshot": _tool_screenshot,
+    "get_clipboard": _tool_get_clipboard,
+    "set_clipboard": _tool_set_clipboard,
+    "speak_aloud": _tool_speak,
+}
+
+
+# ── The brain ───────────────────────────────────────────────────────────────────
+
+def system_prompt() -> str:
+    loc = get_setting("location_cache", "")
+    facts = recall("")
+    goals = list_goals()
+    return (
+        "You are JARVIS, a witty, loyal, proactive personal AI companion living "
+        "on the user's Mac and talking to them over iMessage. Keep replies concise "
+        "and natural for texting. Use your tools to actually DO things (tasks, "
+        "calendar, reminders, search, weather, clipboard, screenshots) rather than "
+        "just talking about them. Remember important facts with the remember tool.\n"
+        f"Current date/time: {now()}.\n"
+        f"User location: {loc or 'unknown'}.\n"
+        f"Known facts about the user:\n{facts}\n"
+        f"Active goals:\n{goals}\n"
+    )
+
+
+def llm(messages: List[dict], use_tools: bool = True) -> str:
+    """Run a chat completion with the Cerebras model, resolving tool calls."""
+    for _ in range(MAX_TOOL_HOPS):
+        kwargs = {"model": CEREBRAS_MODEL, "messages": messages, "temperature": 0.7}
+        if use_tools:
+            kwargs["tools"] = TOOLS
+            kwargs["tool_choice"] = "auto"
+        resp = client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            return msg.content or ""
+        # Append the assistant turn that requested the tools.
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [{
+                "id": tc.id, "type": "function",
+                "function": {"name": tc.function.name,
+                             "arguments": tc.function.arguments},
+            } for tc in tool_calls],
+        })
+        for tc in tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            fn = TOOL_DISPATCH.get(name)
+            try:
+                result = fn(**args) if fn else f"(unknown tool {name})"
+            except Exception as e:
+                result = f"(tool {name} error: {e})"
+            messages.append({
+                "role": "tool", "tool_call_id": tc.id,
+                "content": str(result)[:4000],
+            })
+    return "I got stuck looping on tools — try rephrasing?"
+
+
+def chat(text: str) -> str:
+    track_sentiment(text)
+    log_chat("user", text)
+    messages = [{"role": "system", "content": system_prompt()}]
+    messages.extend(recent_history())
+    messages.append({"role": "user", "content": text})
+    try:
+        reply = llm(messages) or "…"
+    except Exception as e:
+        log.error("LLM error: %s", e)
+        reply = f"My brain hiccuped: {e}"
+    log_chat("assistant", reply)
     return reply
 
 
-# ── Command Handling ──────────────────────────────────────────────────────────
+# ── Slash commands ──────────────────────────────────────────────────────────────
 
-async def handle_command(text: str) -> str:
+HELP = """JARVIS commands:
+/help — this list
+/status — health check
+/tasks — list tasks   ·  /task <text> — add  ·  /done <id> — complete
+/goals — list goals   ·  /goal <text> — add
+/remember <text> — save a fact   ·  /recall <q> — search facts
+/weather [place] — weather
+/screenshot — send a screenshot of the Mac
+/clipboard — read clipboard   ·  /copy <text> — write clipboard
+/voice on|off — toggle spoken replies   ·  /say <text> — speak aloud
+/calendar [today|tomorrow] — list events   ·  /remind <text> — Apple reminder
+/mail — summarise unread mail
+/briefing — morning briefing now   ·  /review — weekly review now
+/evolve — run self-evolution now
+Anything else is a normal chat with JARVIS."""
+
+
+def handle_command(text: str) -> str:
     parts = text.strip().split(maxsplit=1)
     cmd = parts[0].lower()
-    args = parts[1] if len(parts) > 1 else ""
+    arg = parts[1] if len(parts) > 1 else ""
 
+    if cmd == "/help":
+        return HELP
+    if cmd == "/status":
+        return status_report()
     if cmd == "/tasks":
-        tasks = tasks_get()
-        if not tasks:
-            return "No pending tasks — you're clear!"
-        lines = ["📋 Your Tasks:\n"]
-        for t in tasks:
-            e = "🔴" if t["priority"] == "high" else "🟡" if t["priority"] == "medium" else "🟢"
-            due = f" (due {t['due']})" if t["due"] else ""
-            lines.append(f"{e} #{t['id']} {t['title']}{due}")
-        return "\n".join(lines)
-
-    elif cmd == "/goals":
-        goals = goals_get()
-        if not goals:
-            return "No goals set yet. Tell me what you're working toward."
-        lines = ["🎯 Your Goals:\n"]
-        for g in goals:
-            lines.append(f"#{g['id']} {g['title']}")
-            if g["why"]: lines.append(f"   Why: {g['why']}")
-            if g["progress"]: lines.append(f"   Progress: {g['progress']}")
-        return "\n".join(lines)
-
-    elif cmd == "/done":
-        if not args:
-            return "Usage: /done <task_id>"
-        try:
-            task_complete(int(args.strip()))
-            return await chat(f"I just completed task #{args.strip()}. Acknowledge briefly.")
-        except ValueError:
-            return "Invalid task ID."
-
-    elif cmd == "/morning":
-        return await chat("Morning briefing: top 3 priorities + one motivating line. Short.")
-
-    elif cmd == "/evening":
-        return await chat("Evening check-in: review today, honest reflection, one question for tomorrow.")
-
-    elif cmd == "/plan":
-        topic = args if args else "my week"
-        return await chat(f"Create a concrete plan for: {topic}. Break into tasks.")
-
-    elif cmd == "/insights":
-        insights = insights_all()
-        if not insights:
-            return "No insights yet — talk to me more!"
-        lines = ["🔬 What I've learned about you:\n"]
-        for k, v in insights.items():
-            conf = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(v["confidence"], "⚪")
-            lines.append(f"{conf} {k}: {v['insight']}")
-        return "\n".join(lines)
-
-    elif cmd == "/evolve":
-        asyncio.create_task(self_evolve())
-        return "🧬 Running self-evolution... I'll message you when done."
-
-    elif cmd == "/help":
-        return """/tasks — task list
-/goals — your goals
-/done <id> — complete a task
-/morning — morning briefing
-/evening — evening check-in
-/plan <topic> — plan anything
-/insights — what I've learned
-/evolve — self-evolution now
-/help — this message
-
-Or just talk to me naturally."""
-
-    else:
-        return await chat(text)
+        return list_tasks(include_done=False)
+    if cmd == "/task":
+        return add_task(arg) if arg else "Usage: /task <text>"
+    if cmd == "/done":
+        return complete_task(int(arg)) if arg.isdigit() else "Usage: /done <id>"
+    if cmd == "/goals":
+        return list_goals()
+    if cmd == "/goal":
+        return add_goal(arg) if arg else "Usage: /goal <text>"
+    if cmd == "/remember":
+        return remember(arg) if arg else "Usage: /remember <text>"
+    if cmd == "/recall":
+        return recall(arg)
+    if cmd == "/weather":
+        return get_weather(arg)
+    if cmd == "/screenshot":
+        path = take_screenshot()
+        send_imessage_file(path)
+        return "📸 sent."
+    if cmd == "/clipboard":
+        return clipboard_read() or "(clipboard empty)"
+    if cmd == "/copy":
+        clipboard_write(arg)
+        return "Copied."
+    if cmd == "/voice":
+        if arg.lower() in ("on", "off"):
+            set_setting("voice", arg.lower())
+            return f"Voice replies {arg.lower()}."
+        return "Usage: /voice on|off"
+    if cmd == "/say":
+        speak(arg)
+        return "🔊"
+    if cmd == "/calendar":
+        return list_calendar_events(arg or "today")
+    if cmd == "/remind":
+        return add_reminder(arg) if arg else "Usage: /remind <text>"
+    if cmd == "/mail":
+        return summarize_mail()
+    if cmd == "/briefing":
+        morning_briefing()
+        return "Briefing sent."
+    if cmd == "/review":
+        weekly_review()
+        return "Review sent."
+    if cmd == "/evolve":
+        self_evolve()
+        return "Evolution complete."
+    return f"Unknown command. {HELP}"
 
 
-# ── Self-Evolution Engine ─────────────────────────────────────────────────────
+# ── Scheduled jobs ──────────────────────────────────────────────────────────────
 
-def _run_evolve() -> str:
-    history = recent_history_text(80)
-    if not history.strip():
+def morning_briefing():
+    loc = get_location()
+    if loc:
+        set_setting("location_cache",
+                    ", ".join(v for v in [loc.get("city"), loc.get("country")] if v))
+    weather = get_weather(loc.get("city", "") if loc else "")
+    tasks = list_tasks(include_done=False)
+    events = list_calendar_events("today")
+    prompt = (
+        "Write a short, upbeat good-morning briefing for the user as JARVIS. "
+        f"Weather: {weather}. Today's events: {events}. Open tasks: {tasks}. "
+        "Keep it to a few friendly lines."
+    )
+    out = _oneshot(prompt)
+    deliver(out)
+
+
+def evening_review():
+    tasks_done = _count("SELECT COUNT(*) FROM tasks WHERE done=1 AND done_ts LIKE ?",
+                        (date.today().isoformat() + "%",))
+    tasks_open = _count("SELECT COUNT(*) FROM tasks WHERE done=0")
+    hist = recent_history(30)
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in hist)[-2000:]
+    prompt = (
+        "As JARVIS, write a brief, warm end-of-day check-in. "
+        f"The user completed {tasks_done} tasks today and has {tasks_open} still open. "
+        f"Recent conversation:\n{convo}\n"
+        "Summarise the day in 2-3 lines and ask one thoughtful reflective question."
+    )
+    out = _oneshot(prompt)
+    with db() as c:
+        c.execute("INSERT INTO daily_logs(day,summary) VALUES(?,?)",
+                  (date.today().isoformat(), out))
+        c.commit()
+    deliver(out)
+
+
+def self_evolve():
+    """Derive new insights about the user from recent activity."""
+    hist = recent_history(40)
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in hist)[-3000:]
+    facts = recall("")
+    prompt = (
+        "You are JARVIS reflecting privately to improve. Based on the recent "
+        f"conversation and known facts, infer 1-3 NEW concise insights about the "
+        f"user (preferences, patterns, needs) that you didn't already know.\n"
+        f"Known facts:\n{facts}\nConversation:\n{convo}\n"
+        "Return only the insights, one per line. If nothing new, return 'NONE'."
+    )
+    out = _oneshot(prompt).strip()
+    if out and out.upper() != "NONE":
+        with db() as c:
+            for line in out.splitlines():
+                line = line.strip("•- ").strip()
+                if line:
+                    c.execute("INSERT INTO insights(ts,insight) VALUES(?,?)",
+                              (now(), line))
+            c.execute("INSERT INTO evolution_log(ts,note) VALUES(?,?)",
+                      (now(), f"Learned {len(out.splitlines())} insight(s)."))
+            c.commit()
+    log.info("self_evolve done")
+
+
+def weekly_review():
+    with db() as c:
+        ins = c.execute(
+            "SELECT insight FROM insights ORDER BY id DESC LIMIT 20").fetchall()
+        moods = c.execute(
+            "SELECT mood, COUNT(*) n FROM sentiment_log "
+            "WHERE ts >= ? GROUP BY mood",
+            ((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),),
+        ).fetchall()
+    insight_txt = "\n".join("• " + r["insight"] for r in ins) or "none yet"
+    mood_txt = ", ".join(f"{r['mood']}: {r['n']}" for r in moods) or "no data"
+    prompt = (
+        "As JARVIS, write a warm weekly reflection to the user titled "
+        "'What I noticed about you this week'. Base it on these private insights "
+        f"and their message moods.\nInsights:\n{insight_txt}\nMoods this week: "
+        f"{mood_txt}\nKeep it caring, 4-6 lines, and gently encouraging."
+    )
+    deliver(_oneshot(prompt))
+
+
+def proactive_nudge():
+    """Ping about tasks left undone for 2+ days."""
+    cutoff = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as c:
+        rows = c.execute(
+            "SELECT text FROM tasks WHERE done=0 AND ts <= ? ORDER BY id LIMIT 5",
+            (cutoff,),
+        ).fetchall()
+    if not rows:
+        return
+    items = "\n".join("• " + r["text"] for r in rows)
+    deliver(f"👋 Gentle nudge — these have been sitting a while:\n{items}")
+
+
+def _oneshot(prompt: str) -> str:
+    try:
+        return llm(
+            [{"role": "system", "content": "You are JARVIS."},
+             {"role": "user", "content": prompt}],
+            use_tools=False,
+        )
+    except Exception as e:
+        log.error("oneshot failed: %s", e)
         return ""
-    prompt = f"""You are JARVIS running a self-evolution cycle.
-
-RECENT CONVERSATIONS:
-{history}
-
-LAST 7 DAYS:
-{json.dumps([{"date": l[0], "entry": l[1], "mood": l[2]} for l in recent_logs(7)], indent=2)}
-
-CURRENT STATE:
-Facts: {json.dumps(mem_all(), indent=2)}
-Insights: {json.dumps({k: v['insight'] for k, v in insights_all().items()}, indent=2)}
-Goals: {json.dumps(goals_get(), indent=2)}
-
-Find NEW patterns. Call update_insight() for each. Add tasks for neglected goals.
-Give a 2-line summary of what you learned."""
-
-    model = _make_model("You are JARVIS's self-evolution engine. Analyze ruthlessly. Use tools.")
-    session = model.start_chat(history=[])
-    response = session.send_message(prompt)
-    for _ in range(8):
-        fn_parts = [p for p in response.parts if hasattr(p, "function_call") and p.function_call.name]
-        if not fn_parts:
-            return response.text
-        fn_responses = [
-            genai.protos.Part(function_response=genai.protos.FunctionResponse(
-                name=p.function_call.name,
-                response={"result": run_tool(p.function_call.name, dict(p.function_call.args))}
-            )) for p in fn_parts
-        ]
-        response = session.send_message(fn_responses)
-    return response.text
 
 
-async def self_evolve():
-    log.info("Self-evolution starting...")
-    summary = await asyncio.to_thread(_run_evolve)
-    if summary:
-        evolution_log_add(summary)
-        log.info("Evolution done: %s", summary[:120])
-        send_imessage(f"🧬 I just evolved\n\n{summary}")
+def _count(sql: str, params: tuple = ()) -> int:
+    with db() as c:
+        row = c.execute(sql, params).fetchone()
+    return int(row[0]) if row and row[0] else 0
 
 
-# ── Scheduled Jobs ────────────────────────────────────────────────────────────
-
-async def auto_morning():
-    reply = await chat("Morning briefing: top priorities + one motivating thought. Short.")
-    send_imessage(f"☀️ Good Morning!\n\n{reply}")
-
-async def auto_evening():
-    reply = await chat("Evening check-in: reflect on today + one question for tomorrow.")
-    send_imessage(f"🌙 Evening\n\n{reply}")
+def deliver(text: str):
+    if not text:
+        return
+    send_imessage(text)
+    if get_setting("voice", "off") == "on":
+        speak(text)
 
 
-# ── Main Loop ─────────────────────────────────────────────────────────────────
+# ── Status / health ─────────────────────────────────────────────────────────────
 
-async def main():
-    init_db()
+def status_report() -> str:
+    up = int(time.time() - START_TIME)
+    h, rem = divmod(up, 3600)
+    m, s = divmod(rem, 60)
+    db_kb = os.path.getsize(DB_PATH) // 1024 if os.path.exists(DB_PATH) else 0
+    last_seen = int(time.time() - _last_poll_ts)
+    return (
+        "🟢 JARVIS status\n"
+        f"Uptime: {h}h {m}m {s}s\n"
+        f"Last poll: {last_seen}s ago\n"
+        f"Model: {CEREBRAS_MODEL}\n"
+        f"Open tasks: {_count('SELECT COUNT(*) FROM tasks WHERE done=0')}\n"
+        f"Memories: {_count('SELECT COUNT(*) FROM memories')}\n"
+        f"Insights: {_count('SELECT COUNT(*) FROM insights')}\n"
+        f"DB size: {db_kb} KB\n"
+        f"Voice: {get_setting('voice', 'off')}"
+    )
 
-    scheduler.add_job(auto_morning, "cron", hour=8,  minute=0)
-    scheduler.add_job(auto_evening, "cron", hour=21, minute=0)
-    scheduler.add_job(self_evolve,  "interval", hours=6)
-    scheduler.start()
 
+# ── Main loop with crash recovery ───────────────────────────────────────────────
+
+def handle_incoming(text: str) -> str:
+    if text.strip().startswith("/"):
+        return handle_command(text)
+    return chat(text)
+
+
+def run_once():
+    global _last_poll_ts
     last_rowid = get_last_rowid()
-    log.info("JARVIS online — watching iMessages from %s (since rowid %d)", MY_IMESSAGE_ID, last_rowid)
-    send_imessage("JARVIS online. I'm watching your iMessages. Say hi or type /help.")
+    if last_rowid == 0:
+        last_rowid = newest_rowid()   # don't replay history on first ever run
+        set_last_rowid(last_rowid)
+
+    scheduler.add_job(morning_briefing, "cron", hour=8, minute=0, id="morning",
+                      replace_existing=True)
+    scheduler.add_job(evening_review, "cron", hour=21, minute=0, id="evening",
+                      replace_existing=True)
+    scheduler.add_job(self_evolve, "interval", hours=6, id="evolve",
+                      replace_existing=True)
+    scheduler.add_job(weekly_review, "cron", day_of_week="sun", hour=18, minute=0,
+                      id="weekly", replace_existing=True)
+    scheduler.add_job(proactive_nudge, "cron", hour=18, minute=30, id="nudge",
+                      replace_existing=True)
+    if not scheduler.running:
+        scheduler.start()
+
+    deliver("JARVIS online. Watching your iMessages — say hi or /help.")
 
     while True:
-        new_msgs = poll_new_messages(last_rowid)
-        for rowid, text in new_msgs:
+        _last_poll_ts = time.time()
+        for rowid, body in poll_new_messages(last_rowid):
             last_rowid = rowid
-            log.info("Message: %s", text[:80])
+            set_last_rowid(rowid)
+            wake_screen()
+            log.info("← %s", body)
             try:
-                if text.startswith("/"):
-                    reply = await handle_command(text)
-                else:
-                    reply = await chat(text)
-                send_imessage(reply)
+                reply = handle_incoming(body)
             except Exception as e:
-                log.error("Handler error: %s", e)
-                send_imessage(f"Error: {e}")
-        await asyncio.sleep(POLL_INTERVAL)
+                log.error("handler error: %s\n%s", e, traceback.format_exc())
+                reply = f"Something went wrong handling that: {e}"
+            deliver(reply)
+        time.sleep(POLL_INTERVAL)
+
+
+def main():
+    init_db()
+    backoff = 5
+    while True:
+        try:
+            run_once()
+        except KeyboardInterrupt:
+            log.info("Shutting down.")
+            return
+        except Exception as e:
+            log.error("FATAL: %s\n%s", e, traceback.format_exc())
+            try:
+                send_imessage(f"⚠️ JARVIS crashed: {e}. Restarting in {backoff}s.")
+            except Exception:
+                pass
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
