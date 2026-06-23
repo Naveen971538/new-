@@ -43,6 +43,7 @@ Setup (.env in ~/jarvis/.env)
   CEREBRAS_MODEL=llama-3.3-70b
 """
 
+import inspect
 import json
 import logging
 import os
@@ -54,10 +55,13 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from apscheduler.events import EVENT_JOB_ERROR
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -98,7 +102,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler(str(JARVIS_DIR / "jarvis.log")),
+        RotatingFileHandler(
+            str(JARVIS_DIR / "jarvis.log"),
+            maxBytes=5_000_000, backupCount=3,
+        ),
         logging.StreamHandler(),
     ],
 )
@@ -107,11 +114,19 @@ log = logging.getLogger("JARVIS")
 
 # ── Database ────────────────────────────────────────────────────────────────────
 
+@contextmanager
 def db():
-    """A fresh connection (safe to use from scheduler threads)."""
+    """A fresh connection per use, committed on success and ALWAYS closed.
+    WAL + busy_timeout make the threaded scheduler + poll loop coexist safely."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -167,10 +182,11 @@ def set_setting(key: str, value: str):
         c.commit()
 
 
-def get_last_rowid() -> int:
+def get_last_rowid() -> Optional[int]:
+    """Stored high-water mark, or None if we've never seeded one."""
     with db() as c:
         row = c.execute("SELECT value FROM state WHERE key='last_rowid'").fetchone()
-        return int(row["value"]) if row else 0
+        return int(row["value"]) if row else None
 
 
 def set_last_rowid(rowid: int):
@@ -228,7 +244,12 @@ def send_imessage(text: str):
         for chunk in _split(text, 1800):
             res = run_osascript(_SEND_TEXT_SCRIPT, MY_IMESSAGE_ID, chunk)
             if res.returncode != 0:
-                log.error("send_imessage failed: %s", res.stderr.strip())
+                log.error(
+                    "send_imessage failed: %s | Check Messages.app is open, "
+                    "signed into iMessage, and MY_IMESSAGE_ID (%s) is reachable "
+                    "over iMessage (not SMS-only).",
+                    res.stderr.strip(), MY_IMESSAGE_ID,
+                )
             time.sleep(0.3)
 
 
@@ -280,21 +301,21 @@ def clipboard_write(text: str):
 def poll_new_messages(since_rowid: int) -> List[Tuple[int, str]]:
     """Return [(rowid, text)] of incoming texts newer than since_rowid."""
     try:
-        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)
-        rows = conn.execute(
-            """
-            SELECT m.rowid AS rid, m.text AS body
-            FROM   message m
-            JOIN   handle  h ON m.handle_id = h.rowid
-            WHERE  m.rowid > ?
-              AND  m.is_from_me = 0
-              AND  m.text IS NOT NULL
-              AND  h.id = ?
-            ORDER  BY m.rowid
-            """,
-            (since_rowid, MY_IMESSAGE_ID),
-        ).fetchall()
-        conn.close()
+        with closing(sqlite3.connect(
+                f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)) as conn:
+            rows = conn.execute(
+                """
+                SELECT m.rowid AS rid, m.text AS body
+                FROM   message m
+                JOIN   handle  h ON m.handle_id = h.rowid
+                WHERE  m.rowid > ?
+                  AND  m.is_from_me = 0
+                  AND  m.text IS NOT NULL
+                  AND  h.id = ?
+                ORDER  BY m.rowid
+                """,
+                (since_rowid, MY_IMESSAGE_ID),
+            ).fetchall()
         return [(r[0], r[1]) for r in rows]
     except sqlite3.OperationalError as e:
         # Almost always "unable to open database file" = no Full Disk Access.
@@ -302,14 +323,17 @@ def poll_new_messages(since_rowid: int) -> List[Tuple[int, str]]:
         return []
 
 
-def newest_rowid() -> int:
+def newest_rowid() -> Optional[int]:
+    """Highest message rowid, or None if chat.db couldn't be read (so callers
+    can tell 'empty DB' apart from 'read failed' and avoid replaying history)."""
     try:
-        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)
-        row = conn.execute("SELECT MAX(rowid) FROM message").fetchone()
-        conn.close()
+        with closing(sqlite3.connect(
+                f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)) as conn:
+            row = conn.execute("SELECT MAX(rowid) FROM message").fetchone()
         return int(row[0]) if row and row[0] else 0
-    except Exception:
-        return 0
+    except Exception as e:
+        log.error("Cannot read chat.db for seeding (%s).", e)
+        return None
 
 
 # ── Outbound web helpers (stdlib only, no API keys) ─────────────────────────────
@@ -373,6 +397,7 @@ def web_search(query: str) -> str:
 _CAL_ADD = """
 on run {calName, evtTitle, y, mo, d, h, mi, durMin}
     set s to current date
+    set day of s to 1
     set year of s to (y as integer)
     set month of s to (mo as integer)
     set day of s to (d as integer)
@@ -381,7 +406,12 @@ on run {calName, evtTitle, y, mo, d, h, mi, durMin}
     set seconds of s to 0
     set e to s + ((durMin as integer) * minutes)
     tell application "Calendar"
-        tell calendar calName
+        if (count of (calendars whose name is calName)) is 0 then
+            set targetCal to first calendar whose writable is true
+        else
+            set targetCal to first calendar whose name is calName
+        end if
+        tell targetCal
             make new event with properties {summary:evtTitle, start date:s, end date:e}
         end tell
     end tell
@@ -413,7 +443,9 @@ end run
 _REMINDER_ADD = """
 on run {rmTitle}
     tell application "Reminders"
-        make new reminder with properties {name:rmTitle}
+        tell default list
+            make new reminder with properties {name:rmTitle}
+        end tell
     end tell
     return "ok"
 end run
@@ -425,9 +457,9 @@ on run {maxN}
         set msgs to (messages of inbox whose read status is false)
         set total to count of msgs
         set lim to (maxN as integer)
+        if lim > total then set lim to total
         set out to ("Unread: " & total & linefeed)
-        repeat with i from 1 to total
-            if i > lim then exit repeat
+        repeat with i from 1 to lim
             set m to item i of msgs
             set out to out & "• " & (subject of m) & " — " & (sender of m) & linefeed
         end repeat
@@ -718,22 +750,50 @@ def system_prompt() -> str:
     )
 
 
+def _call_tool(name: str, raw_args: str) -> str:
+    fn = TOOL_DISPATCH.get(name)
+    if not fn:
+        return f"(unknown tool {name})"
+    try:
+        args = json.loads(raw_args or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    # Only pass kwargs the function actually accepts, so a stray/extra key
+    # from the model can't raise TypeError.
+    try:
+        params = inspect.signature(fn).parameters
+        if not any(p.kind == p.VAR_KEYWORD for p in params.values()):
+            args = {k: v for k, v in args.items() if k in params}
+    except (TypeError, ValueError):
+        pass
+    try:
+        return str(fn(**args))
+    except Exception as e:
+        return f"(tool {name} error: {e})"
+
+
 def llm(messages: List[dict], use_tools: bool = True) -> str:
     """Run a chat completion with the Cerebras model, resolving tool calls."""
-    for _ in range(MAX_TOOL_HOPS):
+    for hop in range(MAX_TOOL_HOPS):
         kwargs = {"model": CEREBRAS_MODEL, "messages": messages, "temperature": 0.7}
-        if use_tools:
+        last_hop = hop == MAX_TOOL_HOPS - 1
+        if use_tools and not last_hop:
             kwargs["tools"] = TOOLS
             kwargs["tool_choice"] = "auto"
+        # On the final hop we drop the tools so the model MUST answer in text
+        # using whatever tool results it has already gathered.
         resp = client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
             return msg.content or ""
-        # Append the assistant turn that requested the tools.
+        # Append the assistant turn that requested the tools. content stays
+        # None on a tool-call turn (empty string is rejected by some backends).
         messages.append({
             "role": "assistant",
-            "content": msg.content or "",
+            "content": msg.content if msg.content else None,
             "tool_calls": [{
                 "id": tc.id, "type": "function",
                 "function": {"name": tc.function.name,
@@ -741,19 +801,10 @@ def llm(messages: List[dict], use_tools: bool = True) -> str:
             } for tc in tool_calls],
         })
         for tc in tool_calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            fn = TOOL_DISPATCH.get(name)
-            try:
-                result = fn(**args) if fn else f"(unknown tool {name})"
-            except Exception as e:
-                result = f"(tool {name} error: {e})"
+            result = _call_tool(tc.function.name, tc.function.arguments)
             messages.append({
                 "role": "tool", "tool_call_id": tc.id,
-                "content": str(result)[:4000],
+                "content": result[:4000],
             })
     return "I got stuck looping on tools — try rephrasing?"
 
@@ -856,16 +907,17 @@ def handle_command(text: str) -> str:
 
 def morning_briefing():
     loc = get_location()
-    if loc:
-        set_setting("location_cache",
-                    ", ".join(v for v in [loc.get("city"), loc.get("country")] if v))
+    place = ", ".join(v for v in [loc.get("city"), loc.get("country")] if v) if loc else ""
+    if place:
+        set_setting("location_cache", place)
     weather = get_weather(loc.get("city", "") if loc else "")
     tasks = list_tasks(include_done=False)
     events = list_calendar_events("today")
     prompt = (
         "Write a short, upbeat good-morning briefing for the user as JARVIS. "
-        f"Weather: {weather}. Today's events: {events}. Open tasks: {tasks}. "
-        "Keep it to a few friendly lines."
+        f"User location: {place or 'unknown'}. Weather: {weather}. "
+        f"Today's events: {events}. Open tasks: {tasks}. "
+        "Greet them by referencing where they are, then keep it to a few friendly lines."
     )
     out = _oneshot(prompt)
     deliver(out)
@@ -951,6 +1003,45 @@ def proactive_nudge():
     deliver(f"👋 Gentle nudge — these have been sitting a while:\n{items}")
 
 
+def prune_old_data():
+    """Keep the DB from growing forever: trim chat history, old sentiment,
+    and cap the insight/evolution logs."""
+    with db() as c:
+        c.execute(
+            "DELETE FROM chat_history WHERE id < "
+            "(SELECT COALESCE(MAX(id),0) - 5000 FROM chat_history)")
+        c.execute(
+            "DELETE FROM sentiment_log WHERE ts < ?",
+            ((datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S"),))
+        c.execute(
+            "DELETE FROM insights WHERE id < "
+            "(SELECT COALESCE(MAX(id),0) - 500 FROM insights)")
+        c.execute(
+            "DELETE FROM evolution_log WHERE id < "
+            "(SELECT COALESCE(MAX(id),0) - 500 FROM evolution_log)")
+    log.info("prune_old_data done")
+
+
+def safe_job(fn):
+    """Wrap a scheduled job so an exception is logged + alerted instead of
+    silently dying in a scheduler worker thread."""
+    def wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception as e:
+            log.error("job %s failed: %s\n%s", fn.__name__, e, traceback.format_exc())
+            try:
+                send_imessage(f"⚠️ JARVIS job '{fn.__name__}' failed: {e}")
+            except Exception:
+                pass
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _on_job_error(event):
+    log.error("scheduler job %s raised: %s", event.job_id, event.exception)
+
+
 def _oneshot(prompt: str) -> str:
     try:
         return llm(
@@ -1006,30 +1097,38 @@ def handle_incoming(text: str) -> str:
     return chat(text)
 
 
-def run_once():
-    global _last_poll_ts
-    last_rowid = get_last_rowid()
-    if last_rowid == 0:
-        last_rowid = newest_rowid()   # don't replay history on first ever run
-        set_last_rowid(last_rowid)
-
-    scheduler.add_job(morning_briefing, "cron", hour=8, minute=0, id="morning",
-                      replace_existing=True)
-    scheduler.add_job(evening_review, "cron", hour=21, minute=0, id="evening",
-                      replace_existing=True)
-    scheduler.add_job(self_evolve, "interval", hours=6, id="evolve",
-                      replace_existing=True)
-    scheduler.add_job(weekly_review, "cron", day_of_week="sun", hour=18, minute=0,
-                      id="weekly", replace_existing=True)
-    scheduler.add_job(proactive_nudge, "cron", hour=18, minute=30, id="nudge",
-                      replace_existing=True)
+def setup_schedules():
+    scheduler.add_listener(_on_job_error, EVENT_JOB_ERROR)
+    jobs = [
+        (safe_job(morning_briefing), "cron", dict(hour=8, minute=0), "morning"),
+        (safe_job(evening_review), "cron", dict(hour=21, minute=0), "evening"),
+        (safe_job(self_evolve), "interval", dict(hours=6), "evolve"),
+        (safe_job(weekly_review), "cron",
+         dict(day_of_week="sun", hour=18, minute=0), "weekly"),
+        (safe_job(proactive_nudge), "cron", dict(hour=18, minute=30), "nudge"),
+        (safe_job(prune_old_data), "cron", dict(hour=4, minute=0), "prune"),
+    ]
+    for fn, trigger, kw, jid in jobs:
+        scheduler.add_job(fn, trigger, id=jid, replace_existing=True, **kw)
     if not scheduler.running:
         scheduler.start()
 
-    deliver("JARVIS online. Watching your iMessages — say hi or /help.")
 
+def poll_loop():
+    """The single retried unit: seed the high-water mark, then poll forever."""
+    global _last_poll_ts
+    last_rowid = get_last_rowid()   # None until we've successfully seeded
     while True:
         _last_poll_ts = time.time()
+        if last_rowid is None:
+            # First run: skip existing history. If chat.db can't be read yet
+            # (no Full Disk Access), keep retrying rather than replaying all.
+            seed = newest_rowid()
+            if seed is None:
+                time.sleep(POLL_INTERVAL)
+                continue
+            last_rowid = seed
+            set_last_rowid(last_rowid)
         for rowid, body in poll_new_messages(last_rowid):
             last_rowid = rowid
             set_last_rowid(rowid)
@@ -1046,10 +1145,12 @@ def run_once():
 
 def main():
     init_db()
+    setup_schedules()
+    deliver("JARVIS online. Watching your iMessages — say hi or /help.")
     backoff = 5
     while True:
         try:
-            run_once()
+            poll_loop()
         except KeyboardInterrupt:
             log.info("Shutting down.")
             return
