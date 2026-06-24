@@ -95,6 +95,26 @@ sed -i '' "s/YOUR_USERNAME/$(whoami)/g" ~/Library/LaunchAgents/com.jarvis.bot.pl
 launchctl load ~/Library/LaunchAgents/com.jarvis.bot.plist
 ```
 
+## Updating later — one command
+
+Install the updater **once** (sets up an `update-jarvis` shortcut):
+```bash
+mkdir -p ~/jarvis && curl -fsSL --connect-timeout 15 --max-time 120 --retry 2 --retry-delay 2 "https://raw.githubusercontent.com/naveen971538/new-/claude/setup-jarvis-macos-6nfhs/update.sh" -o ~/jarvis/update.sh && [ -s ~/jarvis/update.sh ] && head -n1 ~/jarvis/update.sh | grep -q '^#!/bin/bash' && bash -n ~/jarvis/update.sh && chmod +x ~/jarvis/update.sh && { grep -q 'alias update-jarvis' ~/.bash_profile 2>/dev/null || echo "alias update-jarvis='bash ~/jarvis/update.sh'" >> ~/.bash_profile ; } && echo 'Installed. Open a NEW Terminal window, then type:  update-jarvis'
+```
+
+After that, **whenever you want the latest JARVIS, just open Terminal and type:**
+```bash
+update-jarvis
+```
+(or `bash ~/jarvis/update.sh` if the alias hasn't loaded yet). It safely
+downloads the newest `jarvis.py`, verifies it compiles, backs up the old copy
+to `jarvis.py.bak`, swaps it in atomically, and restarts JARVIS — all in one go.
+It never touches your `.env` or `jarvis.db`, and is safe to run any time. If an
+update ever misbehaves, roll back with:
+```bash
+cp ~/jarvis/jarvis.py.bak ~/jarvis/jarvis.py && bash ~/jarvis/update.sh
+```
+
 ## Commands
 `/help /status /tasks /task /done /goals /goal /remember /recall /weather
 /screenshot /clipboard /copy /voice /say /calendar /remind /mail /briefing
