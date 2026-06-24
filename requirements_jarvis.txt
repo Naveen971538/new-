@@ -1,0 +1,5 @@
+# JARVIS (iMessage + Cerebras edition) — macOS, Python 3.9+
+# On macOS High Sierra (10.13) install with python3.9 -m pip install -r requirements_jarvis.txt
+openai>=1.30,<2
+apscheduler>=3.10.4
+python-dotenv>=1.0.0

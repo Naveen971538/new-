@@ -1,0 +1,1634 @@
+#!/usr/bin/env python3
+"""
+JARVIS — Self-Evolving Personal AI Companion (iMessage + Cerebras Edition)
+
+Runs on macOS. Reads your iMessages from the Messages SQLite database,
+replies via AppleScript, and is powered by the Cerebras inference API
+(OpenAI-compatible, fast, free tier).
+
+Features
+--------
+Core
+  * iMessage in/out (reads ~/Library/Messages/chat.db, sends via osascript)
+  * Cerebras LLM brain with function/tool calling
+  * Persistent SQLite memory (facts, tasks, goals, chat history, insights)
+  * Auto-wakes the Mac's display when a message arrives (caffeinate)
+
+Easy wins
+  * Location-aware morning briefing (IP geolocation + weather)
+  * Voice replies via the macOS `say` command (toggle with /voice)
+  * Screenshot on demand (/screenshot) sent back over iMessage
+  * Clipboard bridge (/clipboard to read, /copy to write)
+
+Productivity
+  * Calendar integration (add/list events in Calendar.app)
+  * Reminders.app sync (push tasks to Apple Reminders)
+  * Mail summariser (summarise unread mail in Mail.app)
+  * Web search tool (free, no API key) so answers use live data
+
+Self-evolving
+  * Self-evolve job derives new insights about you every few hours
+  * Weekly self-review ("what I learned about you this week")
+  * Sentiment tracking of your messages over time
+  * Proactive nudges for tasks left undone
+
+Reliability
+  * Crash auto-recovery loop + iMessage crash alert
+  * /status health check (uptime, last poll, DB size, counts)
+
+Setup (.env in ~/jarvis/.env)
+  CEREBRAS_API_KEY=csk-...          # from https://cloud.cerebras.ai
+  MY_IMESSAGE_ID=+447823753000      # the number/Apple-ID you text FROM
+  # optional:
+  CEREBRAS_MODEL=llama-3.3-70b
+"""
+
+import html
+import inspect
+import json
+import logging
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+import urllib.request
+from contextlib import closing, contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from apscheduler.events import EVENT_JOB_ERROR
+from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+load_dotenv(Path.home() / "jarvis" / ".env")
+load_dotenv()  # also pick up a .env in the current directory if present
+
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+MY_IMESSAGE_ID = os.environ.get("MY_IMESSAGE_ID", "")
+CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
+CEREBRAS_BASE_URL = os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
+
+JARVIS_DIR = Path.home() / "jarvis"
+DB_PATH = os.environ.get("DB_PATH", str(JARVIS_DIR / "jarvis.db"))
+MESSAGES_DB = str(Path.home() / "Library" / "Messages" / "chat.db")
+POLL_INTERVAL = 2          # seconds between iMessage checks
+HISTORY_TURNS = 16         # how many past messages to feed the model
+MAX_TOOL_HOPS = 6          # safety cap on tool-call loops
+HTTP_TIMEOUT = 12          # seconds for outbound web requests
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8787"))  # local web UI
+
+JARVIS_DIR.mkdir(parents=True, exist_ok=True)
+
+if not CEREBRAS_API_KEY or not MY_IMESSAGE_ID:
+    sys.stderr.write(
+        "ERROR: CEREBRAS_API_KEY and MY_IMESSAGE_ID must be set in ~/jarvis/.env\n"
+    )
+    sys.exit(1)
+
+if "@" in MY_IMESSAGE_ID:
+    sys.stderr.write(
+        "WARNING: MY_IMESSAGE_ID looks like an email/Apple ID, not a phone "
+        "number. For phone-number-only access, set MY_IMESSAGE_ID in .env to "
+        "your phone number in international format, e.g. +14155551234\n"
+    )
+
+
+def _normalize_handle(h: str) -> str:
+    """Canonicalize an iMessage handle for comparison. Emails compare
+    case-insensitively; phone numbers compare by digits only, so formatting
+    differences (spaces, dashes, parens, leading 0 vs country code) don't
+    cause a false mismatch."""
+    h = (h or "").strip()
+    if "@" in h:
+        return h.lower()
+    return re.sub(r"\D", "", h)
+
+
+_ALLOWED_HANDLE = _normalize_handle(MY_IMESSAGE_ID)
+_ALLOWED_IS_PHONE = "@" not in MY_IMESSAGE_ID
+
+
+def is_allowed_sender(handle: str) -> bool:
+    """Strict allowlist: only the single configured phone number/Apple ID may
+    talk to JARVIS. Everyone else — including the same person's OTHER Apple ID
+    handle (e.g. their email) if it's not the one configured — is rejected."""
+    n = _normalize_handle(handle)
+    if not n:
+        return False
+    if n == _ALLOWED_HANDLE:
+        return True
+    # Phone fallback: tolerate a missing/extra country code by comparing the
+    # national number (last 10 digits) when both sides are phone numbers.
+    if _ALLOWED_IS_PHONE and "@" not in (handle or ""):
+        if len(n) >= 10 and len(_ALLOWED_HANDLE) >= 10:
+            return n[-10:] == _ALLOWED_HANDLE[-10:]
+    return False
+
+
+_alerted_handles = set()  # de-dupe security alerts within this process run
+
+
+def flag_unauthorized(handle: str, body: str):
+    """Log + alert on a message from anyone other than the allowed sender.
+    Never processed as a command and never replied to."""
+    log.warning("BLOCKED message from unauthorized handle %s: %r", handle, body[:120])
+    try:
+        with db() as c:
+            c.execute(
+                "INSERT INTO security_log(ts, handle, text) VALUES(?,?,?)",
+                (now(), handle, body[:500]),
+            )
+            c.commit()
+    except Exception as e:
+        log.error("failed to record security_log entry: %s", e)
+    if handle not in _alerted_handles:
+        _alerted_handles.add(handle)
+        try:
+            send_imessage(
+                f"🔒 JARVIS security: blocked a message from an unrecognized "
+                f"contact ({handle}). It was ignored, not processed. "
+                f"(Further messages from this contact won't alert again "
+                f"until JARVIS restarts.)"
+            )
+        except Exception:
+            pass
+
+client = OpenAI(api_key=CEREBRAS_API_KEY, base_url=CEREBRAS_BASE_URL)
+scheduler = BackgroundScheduler()
+START_TIME = time.time()
+_last_poll_ts = START_TIME
+_send_lock = threading.Lock()   # serialise AppleScript sends across threads
+_caffeinate_proc: Optional[subprocess.Popen] = None  # keeps system/display awake
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        RotatingFileHandler(
+            str(JARVIS_DIR / "jarvis.log"),
+            maxBytes=5_000_000, backupCount=3,
+        ),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("JARVIS")
+
+
+# ── Database ────────────────────────────────────────────────────────────────────
+
+@contextmanager
+def db():
+    """A fresh connection per use, committed on success and ALWAYS closed.
+    WAL + busy_timeout make the threaded scheduler + poll loop coexist safely."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, fact TEXT);
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, text TEXT, done INTEGER DEFAULT 0, done_ts TEXT);
+            CREATE TABLE IF NOT EXISTS goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, text TEXT, done INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS daily_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT, summary TEXT);
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, role TEXT, content TEXT);
+            CREATE TABLE IF NOT EXISTS insights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, insight TEXT);
+            CREATE TABLE IF NOT EXISTS evolution_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, note TEXT);
+            CREATE TABLE IF NOT EXISTS sentiment_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, message TEXT, mood TEXT, score REAL);
+            CREATE TABLE IF NOT EXISTS security_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, handle TEXT, text TEXT);
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY, value TEXT);
+            """
+        )
+        c.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    with db() as c:
+        c.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        c.commit()
+
+
+def get_last_rowid() -> Optional[int]:
+    """Stored high-water mark, or None if we've never seeded one."""
+    with db() as c:
+        row = c.execute("SELECT value FROM state WHERE key='last_rowid'").fetchone()
+        return int(row["value"]) if row else None
+
+
+def set_last_rowid(rowid: int):
+    with db() as c:
+        c.execute(
+            "INSERT INTO state(key,value) VALUES('last_rowid',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(rowid),),
+        )
+        c.commit()
+
+
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ── macOS helpers (all escaping-safe via osascript argv) ────────────────────────
+
+def run_osascript(script: str, *args: str) -> subprocess.CompletedProcess:
+    """Run an AppleScript. Extra args are passed to the script's `on run argv`
+    handler, which sidesteps every quoting/escaping headache."""
+    return subprocess.run(
+        ["osascript", "-e", script, *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+_SEND_TEXT_SCRIPT = """
+on run {targetId, msgText}
+    tell application "Messages"
+        set targetService to 1st service whose service type = iMessage
+        set targetBuddy to buddy targetId of targetService
+        send msgText to targetBuddy
+    end tell
+end run
+"""
+
+_SEND_FILE_SCRIPT = """
+on run {targetId, filePath}
+    tell application "Messages"
+        set targetService to 1st service whose service type = iMessage
+        set targetBuddy to buddy targetId of targetService
+        send (POSIX file filePath) to targetBuddy
+    end tell
+end run
+"""
+
+
+def send_imessage(text: str):
+    if not text:
+        return
+    with _send_lock:
+        for chunk in _split(text, 1800):
+            res = run_osascript(_SEND_TEXT_SCRIPT, MY_IMESSAGE_ID, chunk)
+            if res.returncode != 0:
+                log.error(
+                    "send_imessage failed: %s | Check Messages.app is open, "
+                    "signed into iMessage, and MY_IMESSAGE_ID (%s) is reachable "
+                    "over iMessage (not SMS-only).",
+                    res.stderr.strip(), MY_IMESSAGE_ID,
+                )
+            time.sleep(0.3)
+
+
+def send_imessage_file(path: str):
+    with _send_lock:
+        res = run_osascript(_SEND_FILE_SCRIPT, MY_IMESSAGE_ID, path)
+        if res.returncode != 0:
+            log.error("send_imessage_file failed: %s", res.stderr.strip())
+
+
+def _split(text: str, size: int) -> List[str]:
+    return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
+
+def stay_awake():
+    """Hold a `caffeinate` assertion for JARVIS's whole lifetime so the iMac
+    never goes to system/disk/display sleep while it's running — a one-shot
+    `-t 5` burst (the old approach) only nudges the display awake for a few
+    seconds and does nothing if the machine has actually gone to sleep
+    between polls, which is why replies stopped when the screen was off.
+    `-w <pid>` ties the assertion to our own process so it dies with us;
+    launchd's KeepAlive then respawns both together on restart.
+    -d display, -i idle system sleep, -m disk sleep, -s system sleep (AC only,
+    fine for a desktop iMac that's always plugged in)."""
+    global _caffeinate_proc
+    try:
+        _caffeinate_proc = subprocess.Popen(
+            ["caffeinate", "-dims", "-w", str(os.getpid())]
+        )
+    except Exception as e:
+        log.warning("stay_awake failed: %s", e)
+
+
+def wake_screen():
+    """Nudge the display on immediately when a message arrives, on top of
+    the standing stay_awake() assertion (display sleep can still dim/blank
+    the screen even while the system itself stays up)."""
+    try:
+        subprocess.Popen(["caffeinate", "-u", "-t", "5"])
+    except Exception as e:
+        log.warning("wake_screen failed: %s", e)
+
+
+def speak(text: str):
+    try:
+        subprocess.Popen(["say", text])
+    except Exception as e:
+        log.warning("speak failed: %s", e)
+
+
+def take_screenshot() -> str:
+    path = str(JARVIS_DIR / "screenshot.png")
+    subprocess.run(["screencapture", "-x", path], timeout=20)
+    return path
+
+
+def clipboard_read() -> str:
+    res = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=10)
+    return res.stdout
+
+
+def clipboard_write(text: str):
+    subprocess.run(["pbcopy"], input=text, text=True, timeout=10)
+
+
+def open_target(target: str) -> str:
+    """Launch an app by name or open a URL/file path via the `open` command
+    (e.g. 'Safari', 'https://...', '/Users/me/file.pdf')."""
+    if not target:
+        return "Usage: /open <app name, URL, or file path>"
+    try:
+        is_app = "://" not in target and not target.startswith("/") and "." not in target.split("/")[-1]
+        cmd = ["open", "-a", target] if is_app else ["open", target]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode != 0:
+            return f"Couldn't open '{target}': {res.stderr.strip() or 'not found'}"
+        return f"Opened {target}."
+    except Exception as e:
+        return f"Couldn't open '{target}': {e}"
+
+
+def find_files(query: str, limit: int = 8) -> str:
+    """Spotlight search via mdfind — no indexing/daemons to install, it's
+    already running as part of macOS."""
+    if not query:
+        return "Usage: /find <search term>"
+    try:
+        res = subprocess.run(
+            ["mdfind", "-name", query], capture_output=True, text=True, timeout=15
+        )
+        hits = [l for l in res.stdout.splitlines() if l.strip()][:limit]
+        if not hits:
+            return f"No files found matching '{query}'."
+        return f"Found {len(hits)} (showing up to {limit}):\n" + "\n".join(hits)
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
+def wifi_network() -> str:
+    try:
+        res = subprocess.run(
+            ["networksetup", "-getairportnetwork", "en0"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return res.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def disk_free_gb() -> Optional[float]:
+    try:
+        res = subprocess.run(["df", "-g", "/"], capture_output=True, text=True, timeout=10)
+        line = res.stdout.strip().splitlines()[-1]
+        return float(line.split()[3])
+    except Exception:
+        return None
+
+
+def messages_app_running() -> bool:
+    res = subprocess.run(
+        ["pgrep", "-x", "Messages"], capture_output=True, text=True, timeout=10
+    )
+    return res.returncode == 0
+
+
+def ensure_messages_running():
+    """Self-heal if Messages.app isn't running — without it, every send
+    silently fails. Relaunch quietly; only alert if it keeps happening."""
+    if messages_app_running():
+        return
+    log.warning("Messages.app not running — relaunching.")
+    try:
+        subprocess.run(["open", "-a", "Messages"], timeout=15)
+        time.sleep(3)
+    except Exception as e:
+        log.error("Failed to relaunch Messages.app: %s", e)
+
+
+# ── iMessage polling ────────────────────────────────────────────────────────────
+
+def poll_new_messages(since_rowid: int) -> List[Tuple[int, str, str]]:
+    """Return [(rowid, handle, text)] of ALL incoming texts newer than
+    since_rowid, from ANY sender. Deliberately not filtered to MY_IMESSAGE_ID
+    here — the allowlist check happens in poll_loop so messages from anyone
+    else can be logged/alerted as a possible intrusion attempt instead of
+    silently vanishing inside the SQL WHERE clause."""
+    try:
+        with closing(sqlite3.connect(
+                f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)) as conn:
+            rows = conn.execute(
+                """
+                SELECT m.rowid AS rid, h.id AS handle, m.text AS body
+                FROM   message m
+                JOIN   handle  h ON m.handle_id = h.rowid
+                WHERE  m.rowid > ?
+                  AND  m.is_from_me = 0
+                  AND  m.text IS NOT NULL
+                ORDER  BY m.rowid
+                """,
+                (since_rowid,),
+            ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+    except sqlite3.OperationalError as e:
+        # Almost always "unable to open database file" = no Full Disk Access.
+        log.error("Cannot read chat.db (%s). Grant Terminal Full Disk Access.", e)
+        return []
+
+
+def newest_rowid() -> Optional[int]:
+    """Highest message rowid, or None if chat.db couldn't be read (so callers
+    can tell 'empty DB' apart from 'read failed' and avoid replaying history)."""
+    try:
+        with closing(sqlite3.connect(
+                f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)) as conn:
+            row = conn.execute("SELECT MAX(rowid) FROM message").fetchone()
+        return int(row[0]) if row and row[0] else 0
+    except Exception as e:
+        log.error("Cannot read chat.db for seeding (%s).", e)
+        return None
+
+
+# ── Outbound web helpers (stdlib only, no API keys) ─────────────────────────────
+
+def _http_get(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "JARVIS/1.0"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def get_location() -> dict:
+    """Best-effort city/region/country via free IP geolocation."""
+    try:
+        data = json.loads(_http_get("http://ip-api.com/json/"))
+        if data.get("status") == "success":
+            return {
+                "city": data.get("city", ""),
+                "region": data.get("regionName", ""),
+                "country": data.get("country", ""),
+            }
+    except Exception as e:
+        log.warning("get_location failed: %s", e)
+    return {}
+
+
+def get_weather(location: str = "") -> str:
+    """One-line weather from wttr.in (free, no key)."""
+    try:
+        if not location:
+            loc = get_location()
+            location = loc.get("city", "")
+        q = urllib.parse.quote(location)
+        return _http_get(f"https://wttr.in/{q}?format=%l:+%c+%t,+feels+%f,+%h+humidity").strip()
+    except Exception as e:
+        return f"(weather unavailable: {e})"
+
+
+def web_search(query: str) -> str:
+    """Free, key-less search via DuckDuckGo's Instant Answer API. Returns a
+    short text summary; good for facts/definitions, limited for breaking news."""
+    try:
+        q = urllib.parse.quote(query)
+        data = json.loads(
+            _http_get(f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1")
+        )
+        parts = []
+        if data.get("AbstractText"):
+            parts.append(data["AbstractText"])
+        if data.get("Answer"):
+            parts.append(data["Answer"])
+        for t in data.get("RelatedTopics", [])[:5]:
+            if isinstance(t, dict) and t.get("Text"):
+                parts.append("• " + t["Text"])
+        return "\n".join(parts) if parts else "No direct result found."
+    except Exception as e:
+        return f"(search unavailable: {e})"
+
+
+# ── Calendar / Reminders / Mail (AppleScript) ───────────────────────────────────
+
+_CAL_ADD = """
+on run {calName, evtTitle, y, mo, d, h, mi, durMin}
+    set s to current date
+    set day of s to 1
+    set year of s to (y as integer)
+    set month of s to (mo as integer)
+    set day of s to (d as integer)
+    set hours of s to (h as integer)
+    set minutes of s to (mi as integer)
+    set seconds of s to 0
+    set e to s + ((durMin as integer) * minutes)
+    tell application "Calendar"
+        if (count of (calendars whose name is calName)) is 0 then
+            set targetCal to first calendar whose writable is true
+        else
+            set targetCal to first calendar whose name is calName
+        end if
+        tell targetCal
+            make new event with properties {summary:evtTitle, start date:s, end date:e}
+        end tell
+    end tell
+    return "ok"
+end run
+"""
+
+_CAL_LIST = """
+on run {whichDay}
+    set out to ""
+    set startD to current date
+    set hours of startD to 0
+    set minutes of startD to 0
+    set seconds of startD to 0
+    if whichDay is "tomorrow" then set startD to startD + (1 * days)
+    set endD to startD + (1 * days)
+    tell application "Calendar"
+        repeat with cal in calendars
+            set evs to (every event of cal whose start date is greater than or equal to startD and start date is less than endD)
+            repeat with ev in evs
+                set out to out & (summary of ev) & " @ " & (time string of (start date of ev)) & linefeed
+            end repeat
+        end repeat
+    end tell
+    return out
+end run
+"""
+
+_REMINDER_ADD = """
+on run {rmTitle}
+    tell application "Reminders"
+        tell default list
+            make new reminder with properties {name:rmTitle}
+        end tell
+    end tell
+    return "ok"
+end run
+"""
+
+_MAIL_UNREAD = """
+on run {maxN}
+    tell application "Mail"
+        set msgs to (messages of inbox whose read status is false)
+        set total to count of msgs
+        set lim to (maxN as integer)
+        if lim > total then set lim to total
+        set out to ("Unread: " & total & linefeed)
+        repeat with i from 1 to lim
+            set m to item i of msgs
+            set out to out & "• " & (subject of m) & " — " & (sender of m) & linefeed
+        end repeat
+        return out
+    end tell
+end run
+"""
+
+
+_CAL_DELETE = """
+on run {whichDay, titleMatch}
+    set startD to current date
+    set hours of startD to 0
+    set minutes of startD to 0
+    set seconds of startD to 0
+    if whichDay is "tomorrow" then set startD to startD + (1 * days)
+    set endD to startD + (1 * days)
+    set deleted to 0
+    tell application "Calendar"
+        repeat with cal in calendars
+            set evs to (every event of cal whose start date is greater than or equal to startD and start date is less than endD and summary contains titleMatch)
+            repeat with ev in evs
+                delete ev
+                set deleted to deleted + 1
+            end repeat
+        end repeat
+    end tell
+    return deleted as string
+end run
+"""
+
+
+def add_calendar_event(title: str, when_iso: str, duration_min: int = 60,
+                       calendar_name: str = "") -> str:
+    """when_iso: 'YYYY-MM-DD HH:MM'."""
+    try:
+        dt = datetime.strptime(when_iso.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return "Bad date. Use 'YYYY-MM-DD HH:MM'."
+    cal = calendar_name or get_setting("calendar_name", "Calendar")
+    res = run_osascript(
+        _CAL_ADD, cal, title,
+        str(dt.year), str(dt.month), str(dt.day), str(dt.hour), str(dt.minute),
+        str(int(duration_min)),
+    )
+    if res.returncode != 0:
+        return f"Couldn't add event (calendar '{cal}'?): {res.stderr.strip()}"
+    return f"Added '{title}' on {when_iso}."
+
+
+def list_calendar_events(which_day: str = "today") -> str:
+    res = run_osascript(_CAL_LIST, which_day)
+    if res.returncode != 0:
+        return f"(calendar unavailable: {res.stderr.strip()})"
+    return res.stdout.strip() or f"No events {which_day}."
+
+
+def delete_calendar_event(title_match: str, which_day: str = "today") -> str:
+    """Delete event(s) on which_day whose title CONTAINS title_match.
+    Matches by substring across all calendars, so be specific."""
+    if not title_match.strip():
+        return "Usage: /delevent <day: today|tomorrow> <title text to match>"
+    res = run_osascript(_CAL_DELETE, which_day, title_match)
+    if res.returncode != 0:
+        return f"Couldn't delete event: {res.stderr.strip()}"
+    n = res.stdout.strip()
+    if n == "0":
+        return f"No {which_day} event matching '{title_match}' found."
+    return f"Deleted {n} event(s) matching '{title_match}' ({which_day})."
+
+
+def set_calendar_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return "Usage: /setcalendar <calendar name>"
+    set_setting("calendar_name", name)
+    return f"OK — new events will be added to the '{name}' calendar."
+
+
+def add_reminder(text: str) -> str:
+    res = run_osascript(_REMINDER_ADD, text)
+    if res.returncode != 0:
+        return f"(reminder failed: {res.stderr.strip()})"
+    return f"Reminder added: {text}"
+
+
+def summarize_mail(max_n: int = 10) -> str:
+    res = run_osascript(_MAIL_UNREAD, str(max_n))
+    if res.returncode != 0:
+        return "(Mail app must be open/configured to read mail.)"
+    return res.stdout.strip() or "No unread mail."
+
+
+# ── Memory helpers ──────────────────────────────────────────────────────────────
+
+def remember(fact: str) -> str:
+    with db() as c:
+        c.execute("INSERT INTO memories(ts,fact) VALUES(?,?)", (now(), fact))
+        c.commit()
+    return f"Noted: {fact}"
+
+
+def recall(query: str = "") -> str:
+    with db() as c:
+        if query:
+            rows = c.execute(
+                "SELECT fact FROM memories WHERE fact LIKE ? ORDER BY id DESC LIMIT 15",
+                (f"%{query}%",),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT fact FROM memories ORDER BY id DESC LIMIT 15"
+            ).fetchall()
+    return "\n".join("• " + r["fact"] for r in rows) or "I don't recall anything on that."
+
+
+def add_task(text: str) -> str:
+    with db() as c:
+        c.execute("INSERT INTO tasks(ts,text) VALUES(?,?)", (now(), text))
+        c.commit()
+    return f"Task added: {text}"
+
+
+def list_tasks(include_done: bool = False) -> str:
+    with db() as c:
+        if include_done:
+            rows = c.execute("SELECT id,text,done FROM tasks ORDER BY id").fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id,text,done FROM tasks WHERE done=0 ORDER BY id"
+            ).fetchall()
+    if not rows:
+        return "No tasks. 🎉"
+    return "\n".join(
+        f"{r['id']}. [{'x' if r['done'] else ' '}] {r['text']}" for r in rows
+    )
+
+
+def complete_task(task_id: int) -> str:
+    with db() as c:
+        cur = c.execute(
+            "UPDATE tasks SET done=1, done_ts=? WHERE id=?", (now(), task_id)
+        )
+        c.commit()
+    return f"Task {task_id} done. ✅" if cur.rowcount else f"No task #{task_id}."
+
+
+def add_goal(text: str) -> str:
+    with db() as c:
+        c.execute("INSERT INTO goals(ts,text) VALUES(?,?)", (now(), text))
+        c.commit()
+    return f"Goal added: {text}"
+
+
+def list_goals() -> str:
+    with db() as c:
+        rows = c.execute("SELECT id,text FROM goals WHERE done=0 ORDER BY id").fetchall()
+    return "\n".join(f"{r['id']}. {r['text']}" for r in rows) or "No goals set yet."
+
+
+def log_chat(role: str, content: str):
+    with db() as c:
+        c.execute(
+            "INSERT INTO chat_history(ts,role,content) VALUES(?,?,?)",
+            (now(), role, content),
+        )
+        c.commit()
+
+
+def recent_history(limit: int = HISTORY_TURNS) -> List[dict]:
+    with db() as c:
+        rows = c.execute(
+            "SELECT role,content FROM chat_history ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+# ── Sentiment tracking (lightweight heuristic) ──────────────────────────────────
+
+_POS = {"good", "great", "happy", "awesome", "love", "excited", "thanks",
+        "amazing", "win", "done", "yay", "nice", "glad", "excellent"}
+_NEG = {"tired", "sad", "angry", "stressed", "anxious", "bad", "hate",
+        "exhausted", "worried", "depressed", "lonely", "sick", "frustrated",
+        "annoyed", "upset", "cant", "can't", "fail", "failed"}
+
+
+def track_sentiment(message: str):
+    words = {w.strip(".,!?").lower() for w in message.split()}
+    pos = len(words & _POS)
+    neg = len(words & _NEG)
+    score = pos - neg
+    mood = "positive" if score > 0 else "negative" if score < 0 else "neutral"
+    with db() as c:
+        c.execute(
+            "INSERT INTO sentiment_log(ts,message,mood,score) VALUES(?,?,?,?)",
+            (now(), message[:300], mood, float(score)),
+        )
+        c.commit()
+
+
+# ── LLM tool definitions ────────────────────────────────────────────────────────
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "remember", "description": "Save a durable fact about the user.",
+        "parameters": {"type": "object", "properties": {
+            "fact": {"type": "string"}}, "required": ["fact"]}}},
+    {"type": "function", "function": {
+        "name": "recall", "description": "Search saved facts about the user.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "add_task", "description": "Add a to-do task.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "list_tasks", "description": "List open tasks.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "complete_task", "description": "Mark a task done by id.",
+        "parameters": {"type": "object", "properties": {
+            "task_id": {"type": "integer"}}, "required": ["task_id"]}}},
+    {"type": "function", "function": {
+        "name": "add_goal", "description": "Add a longer-term goal.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "list_goals", "description": "List active goals.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "web_search", "description": "Search the web for live facts.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "get_weather", "description": "Current weather; blank = here.",
+        "parameters": {"type": "object", "properties": {
+            "location": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "add_calendar_event",
+        "description": "Add a Calendar.app event. when_iso='YYYY-MM-DD HH:MM'.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "when_iso": {"type": "string"},
+            "duration_min": {"type": "integer"}},
+            "required": ["title", "when_iso"]}}},
+    {"type": "function", "function": {
+        "name": "list_calendar_events",
+        "description": "List events; which_day 'today' or 'tomorrow'.",
+        "parameters": {"type": "object", "properties": {
+            "which_day": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "delete_calendar_event",
+        "description": "Delete Calendar.app event(s) on a day whose title contains title_match.",
+        "parameters": {"type": "object", "properties": {
+            "title_match": {"type": "string"},
+            "which_day": {"type": "string"}},
+            "required": ["title_match"]}}},
+    {"type": "function", "function": {
+        "name": "set_calendar_name",
+        "description": "Set which Calendar.app calendar new events are added to.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "add_reminder", "description": "Add an Apple Reminders reminder.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "summarize_mail", "description": "Summarise unread Mail.app mail.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "take_screenshot",
+        "description": "Capture the Mac screen and send it to the user.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "get_clipboard", "description": "Read the Mac clipboard.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "set_clipboard", "description": "Write text to the Mac clipboard.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "speak_aloud", "description": "Say text out loud on the Mac.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "open_target",
+        "description": "Launch an app by name, or open a URL/file path, on the Mac.",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string"}}, "required": ["target"]}}},
+    {"type": "function", "function": {
+        "name": "find_files",
+        "description": "Spotlight-search the Mac for files matching a name.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+]
+
+
+def _tool_screenshot() -> str:
+    path = take_screenshot()
+    send_imessage_file(path)
+    return "Screenshot captured and sent."
+
+
+def _tool_get_clipboard() -> str:
+    return clipboard_read() or "(clipboard empty)"
+
+
+def _tool_set_clipboard(text: str) -> str:
+    clipboard_write(text)
+    return "Copied to clipboard."
+
+
+def _tool_speak(text: str) -> str:
+    speak(text)
+    return "Spoken."
+
+
+TOOL_DISPATCH = {
+    "remember": remember,
+    "recall": recall,
+    "add_task": add_task,
+    "list_tasks": lambda: list_tasks(False),
+    "complete_task": complete_task,
+    "add_goal": add_goal,
+    "list_goals": list_goals,
+    "web_search": web_search,
+    "get_weather": get_weather,
+    "add_calendar_event": add_calendar_event,
+    "list_calendar_events": list_calendar_events,
+    "delete_calendar_event": delete_calendar_event,
+    "set_calendar_name": set_calendar_name,
+    "add_reminder": add_reminder,
+    "summarize_mail": lambda: summarize_mail(10),
+    "take_screenshot": _tool_screenshot,
+    "get_clipboard": _tool_get_clipboard,
+    "set_clipboard": _tool_set_clipboard,
+    "speak_aloud": _tool_speak,
+    "open_target": open_target,
+    "find_files": find_files,
+}
+
+
+# ── The brain ───────────────────────────────────────────────────────────────────
+
+def system_prompt() -> str:
+    loc = get_setting("location_cache", "")
+    facts = recall("")
+    goals = list_goals()
+    return (
+        "You are JARVIS, a witty, loyal, proactive personal AI companion living "
+        "on the user's Mac and talking to them over iMessage. Keep replies concise "
+        "and natural for texting. Use your tools to actually DO things (tasks, "
+        "calendar, reminders, search, weather, clipboard, screenshots) rather than "
+        "just talking about them. Remember important facts with the remember tool.\n"
+        f"Current date/time: {now()}.\n"
+        f"User location: {loc or 'unknown'}.\n"
+        f"Known facts about the user:\n{facts}\n"
+        f"Active goals:\n{goals}\n"
+    )
+
+
+def _call_tool(name: str, raw_args: str) -> str:
+    fn = TOOL_DISPATCH.get(name)
+    if not fn:
+        return f"(unknown tool {name})"
+    try:
+        args = json.loads(raw_args or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    # Only pass kwargs the function actually accepts, so a stray/extra key
+    # from the model can't raise TypeError.
+    try:
+        params = inspect.signature(fn).parameters
+        if not any(p.kind == p.VAR_KEYWORD for p in params.values()):
+            args = {k: v for k, v in args.items() if k in params}
+    except (TypeError, ValueError):
+        pass
+    try:
+        return str(fn(**args))
+    except Exception as e:
+        return f"(tool {name} error: {e})"
+
+
+def llm(messages: List[dict], use_tools: bool = True) -> str:
+    """Run a chat completion with the Cerebras model, resolving tool calls."""
+    for hop in range(MAX_TOOL_HOPS):
+        kwargs = {"model": CEREBRAS_MODEL, "messages": messages, "temperature": 0.7}
+        last_hop = hop == MAX_TOOL_HOPS - 1
+        if use_tools and not last_hop:
+            kwargs["tools"] = TOOLS
+            kwargs["tool_choice"] = "auto"
+        # On the final hop we drop the tools so the model MUST answer in text
+        # using whatever tool results it has already gathered.
+        resp = client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            return msg.content or ""
+        # Append the assistant turn that requested the tools. content stays
+        # None on a tool-call turn (empty string is rejected by some backends).
+        messages.append({
+            "role": "assistant",
+            "content": msg.content if msg.content else None,
+            "tool_calls": [{
+                "id": tc.id, "type": "function",
+                "function": {"name": tc.function.name,
+                             "arguments": tc.function.arguments},
+            } for tc in tool_calls],
+        })
+        for tc in tool_calls:
+            result = _call_tool(tc.function.name, tc.function.arguments)
+            messages.append({
+                "role": "tool", "tool_call_id": tc.id,
+                "content": result[:4000],
+            })
+    return "I got stuck looping on tools — try rephrasing?"
+
+
+def chat(text: str) -> str:
+    track_sentiment(text)
+    log_chat("user", text)
+    messages = [{"role": "system", "content": system_prompt()}]
+    messages.extend(recent_history())
+    messages.append({"role": "user", "content": text})
+    try:
+        reply = llm(messages) or "…"
+    except Exception as e:
+        log.error("LLM error: %s", e)
+        reply = f"My brain hiccuped: {e}"
+    log_chat("assistant", reply)
+    return reply
+
+
+# ── Slash commands ──────────────────────────────────────────────────────────────
+
+HELP = """JARVIS commands:
+/help — this list
+/status — health check
+/tasks — list tasks   ·  /task <text> — add  ·  /done <id> — complete
+/goals — list goals   ·  /goal <text> — add
+/remember <text> — save a fact   ·  /recall <q> — search facts
+/weather [place] — weather
+/screenshot — send a screenshot of the Mac
+/clipboard — read clipboard   ·  /copy <text> — write clipboard
+/voice on|off — toggle spoken replies   ·  /say <text> — speak aloud
+/calendar [today|tomorrow] — list events   ·  /remind <text> — Apple reminder
+/delevent <today|tomorrow> <title text> — delete matching event(s)
+/setcalendar <name> — set which calendar new events are added to
+/mail — summarise unread mail
+/briefing — morning briefing now   ·  /review — weekly review now
+/evolve — run self-evolution now
+/open <app|url|path> — launch an app, URL, or file on the Mac
+/find <query> — Spotlight search for files on the Mac
+/dashboard — open the live visual dashboard in your browser
+/security — show recent blocked/unauthorized contact attempts
+Anything else is a normal chat with JARVIS."""
+
+
+def handle_command(text: str) -> str:
+    parts = text.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd == "/help":
+        return HELP
+    if cmd == "/status":
+        return status_report()
+    if cmd == "/tasks":
+        return list_tasks(include_done=False)
+    if cmd == "/task":
+        return add_task(arg) if arg else "Usage: /task <text>"
+    if cmd == "/done":
+        return complete_task(int(arg)) if arg.isdigit() else "Usage: /done <id>"
+    if cmd == "/goals":
+        return list_goals()
+    if cmd == "/goal":
+        return add_goal(arg) if arg else "Usage: /goal <text>"
+    if cmd == "/remember":
+        return remember(arg) if arg else "Usage: /remember <text>"
+    if cmd == "/recall":
+        return recall(arg)
+    if cmd == "/weather":
+        return get_weather(arg)
+    if cmd == "/screenshot":
+        path = take_screenshot()
+        send_imessage_file(path)
+        return "📸 sent."
+    if cmd == "/clipboard":
+        return clipboard_read() or "(clipboard empty)"
+    if cmd == "/copy":
+        clipboard_write(arg)
+        return "Copied."
+    if cmd == "/voice":
+        if arg.lower() in ("on", "off"):
+            set_setting("voice", arg.lower())
+            return f"Voice replies {arg.lower()}."
+        return "Usage: /voice on|off"
+    if cmd == "/say":
+        speak(arg)
+        return "🔊"
+    if cmd == "/calendar":
+        return list_calendar_events(arg or "today")
+    if cmd == "/setcalendar":
+        return set_calendar_name(arg)
+    if cmd == "/delevent":
+        dparts = arg.split(maxsplit=1)
+        if len(dparts) == 2 and dparts[0].lower() in ("today", "tomorrow"):
+            return delete_calendar_event(dparts[1], dparts[0].lower())
+        return delete_calendar_event(arg, "today")
+    if cmd == "/remind":
+        return add_reminder(arg) if arg else "Usage: /remind <text>"
+    if cmd == "/mail":
+        return summarize_mail()
+    if cmd == "/briefing":
+        morning_briefing()
+        return "Briefing sent."
+    if cmd == "/review":
+        weekly_review()
+        return "Review sent."
+    if cmd == "/evolve":
+        self_evolve()
+        return "Evolution complete."
+    if cmd == "/open":
+        return open_target(arg)
+    if cmd == "/find":
+        return find_files(arg)
+    if cmd == "/dashboard":
+        url = f"http://localhost:{DASHBOARD_PORT}"
+        subprocess.Popen(["open", url])
+        return f"🖥️ Opening the JARVIS dashboard: {url}"
+    if cmd == "/security":
+        return security_report()
+    return f"Unknown command. {HELP}"
+
+
+# ── Scheduled jobs ──────────────────────────────────────────────────────────────
+
+def morning_briefing():
+    loc = get_location()
+    place = ", ".join(v for v in [loc.get("city"), loc.get("country")] if v) if loc else ""
+    if place:
+        set_setting("location_cache", place)
+    weather = get_weather(loc.get("city", "") if loc else "")
+    tasks = list_tasks(include_done=False)
+    events = list_calendar_events("today")
+    prompt = (
+        "Write a short, upbeat good-morning briefing for the user as JARVIS. "
+        f"User location: {place or 'unknown'}. Weather: {weather}. "
+        f"Today's events: {events}. Open tasks: {tasks}. "
+        "Greet them by referencing where they are, then keep it to a few friendly lines."
+    )
+    out = _oneshot(prompt)
+    deliver(out)
+
+
+def evening_review():
+    tasks_done = _count("SELECT COUNT(*) FROM tasks WHERE done=1 AND done_ts LIKE ?",
+                        (date.today().isoformat() + "%",))
+    tasks_open = _count("SELECT COUNT(*) FROM tasks WHERE done=0")
+    hist = recent_history(30)
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in hist)[-2000:]
+    prompt = (
+        "As JARVIS, write a brief, warm end-of-day check-in. "
+        f"The user completed {tasks_done} tasks today and has {tasks_open} still open. "
+        f"Recent conversation:\n{convo}\n"
+        "Summarise the day in 2-3 lines and ask one thoughtful reflective question."
+    )
+    out = _oneshot(prompt)
+    with db() as c:
+        c.execute("INSERT INTO daily_logs(day,summary) VALUES(?,?)",
+                  (date.today().isoformat(), out))
+        c.commit()
+    deliver(out)
+
+
+def self_evolve():
+    """Derive new insights about the user from recent activity."""
+    hist = recent_history(40)
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in hist)[-3000:]
+    facts = recall("")
+    prompt = (
+        "You are JARVIS reflecting privately to improve. Based on the recent "
+        f"conversation and known facts, infer 1-3 NEW concise insights about the "
+        f"user (preferences, patterns, needs) that you didn't already know.\n"
+        f"Known facts:\n{facts}\nConversation:\n{convo}\n"
+        "Return only the insights, one per line. If nothing new, return 'NONE'."
+    )
+    out = _oneshot(prompt).strip()
+    if out and out.upper() != "NONE":
+        with db() as c:
+            for line in out.splitlines():
+                line = line.strip("•- ").strip()
+                if line:
+                    c.execute("INSERT INTO insights(ts,insight) VALUES(?,?)",
+                              (now(), line))
+            c.execute("INSERT INTO evolution_log(ts,note) VALUES(?,?)",
+                      (now(), f"Learned {len(out.splitlines())} insight(s)."))
+            c.commit()
+    log.info("self_evolve done")
+
+
+def weekly_review():
+    with db() as c:
+        ins = c.execute(
+            "SELECT insight FROM insights ORDER BY id DESC LIMIT 20").fetchall()
+        moods = c.execute(
+            "SELECT mood, COUNT(*) n FROM sentiment_log "
+            "WHERE ts >= ? GROUP BY mood",
+            ((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),),
+        ).fetchall()
+    insight_txt = "\n".join("• " + r["insight"] for r in ins) or "none yet"
+    mood_txt = ", ".join(f"{r['mood']}: {r['n']}" for r in moods) or "no data"
+    prompt = (
+        "As JARVIS, write a warm weekly reflection to the user titled "
+        "'What I noticed about you this week'. Base it on these private insights "
+        f"and their message moods.\nInsights:\n{insight_txt}\nMoods this week: "
+        f"{mood_txt}\nKeep it caring, 4-6 lines, and gently encouraging."
+    )
+    deliver(_oneshot(prompt))
+
+
+def proactive_nudge():
+    """Ping about tasks left undone for 2+ days."""
+    cutoff = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as c:
+        rows = c.execute(
+            "SELECT text FROM tasks WHERE done=0 AND ts <= ? ORDER BY id LIMIT 5",
+            (cutoff,),
+        ).fetchall()
+    if not rows:
+        return
+    items = "\n".join("• " + r["text"] for r in rows)
+    deliver(f"👋 Gentle nudge — these have been sitting a while:\n{items}")
+
+
+def prune_old_data():
+    """Keep the DB from growing forever: trim chat history, old sentiment,
+    and cap the insight/evolution logs."""
+    with db() as c:
+        c.execute(
+            "DELETE FROM chat_history WHERE id < "
+            "(SELECT COALESCE(MAX(id),0) - 5000 FROM chat_history)")
+        c.execute(
+            "DELETE FROM sentiment_log WHERE ts < ?",
+            ((datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S"),))
+        c.execute(
+            "DELETE FROM insights WHERE id < "
+            "(SELECT COALESCE(MAX(id),0) - 500 FROM insights)")
+        c.execute(
+            "DELETE FROM evolution_log WHERE id < "
+            "(SELECT COALESCE(MAX(id),0) - 500 FROM evolution_log)")
+    log.info("prune_old_data done")
+
+
+def safe_job(fn):
+    """Wrap a scheduled job so an exception is logged + alerted instead of
+    silently dying in a scheduler worker thread."""
+    def wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception as e:
+            log.error("job %s failed: %s\n%s", fn.__name__, e, traceback.format_exc())
+            try:
+                send_imessage(f"⚠️ JARVIS job '{fn.__name__}' failed: {e}")
+            except Exception:
+                pass
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _on_job_error(event):
+    log.error("scheduler job %s raised: %s", event.job_id, event.exception)
+
+
+def _oneshot(prompt: str) -> str:
+    try:
+        return llm(
+            [{"role": "system", "content": "You are JARVIS."},
+             {"role": "user", "content": prompt}],
+            use_tools=False,
+        )
+    except Exception as e:
+        log.error("oneshot failed: %s", e)
+        return ""
+
+
+def _count(sql: str, params: tuple = ()) -> int:
+    with db() as c:
+        row = c.execute(sql, params).fetchone()
+    return int(row[0]) if row and row[0] else 0
+
+
+def deliver(text: str):
+    if not text:
+        return
+    send_imessage(text)
+    if get_setting("voice", "off") == "on":
+        speak(text)
+
+
+# ── Status / health ─────────────────────────────────────────────────────────────
+
+def status_report() -> str:
+    up = int(time.time() - START_TIME)
+    h, rem = divmod(up, 3600)
+    m, s = divmod(rem, 60)
+    db_kb = os.path.getsize(DB_PATH) // 1024 if os.path.exists(DB_PATH) else 0
+    last_seen = int(time.time() - _last_poll_ts)
+    free_gb = disk_free_gb()
+    disk_line = f"Disk free: {free_gb:.1f}GB\n" if free_gb is not None else ""
+    return (
+        "🟢 JARVIS status\n"
+        f"Uptime: {h}h {m}m {s}s\n"
+        f"Last poll: {last_seen}s ago\n"
+        f"Model: {CEREBRAS_MODEL}\n"
+        f"Open tasks: {_count('SELECT COUNT(*) FROM tasks WHERE done=0')}\n"
+        f"Memories: {_count('SELECT COUNT(*) FROM memories')}\n"
+        f"Insights: {_count('SELECT COUNT(*) FROM insights')}\n"
+        f"DB size: {db_kb} KB\n"
+        f"{disk_line}"
+        f"Messages.app: {'running' if messages_app_running() else '⚠️ NOT running'}\n"
+        f"Wi-Fi: {wifi_network()}\n"
+        f"Voice: {get_setting('voice', 'off')}"
+    )
+
+
+def security_report() -> str:
+    allowed = MY_IMESSAGE_ID
+    with db() as c:
+        rows = c.execute(
+            "SELECT ts, handle, text FROM security_log ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        total = c.execute("SELECT COUNT(*) FROM security_log").fetchone()[0]
+    if not rows:
+        return (
+            f"🔒 Security\nAllowed sender: {allowed}\n"
+            f"No unauthorized contact attempts recorded."
+        )
+    lines = [f"🔒 Security\nAllowed sender: {allowed}\n"
+             f"{total} blocked attempt(s) total. Most recent:"]
+    for r in rows:
+        preview = r["text"][:60] + ("…" if len(r["text"]) > 60 else "")
+        lines.append(f"  {r['ts']} — {r['handle']}: {preview!r}")
+    return "\n".join(lines)
+
+
+# ── Live web dashboard (stdlib http.server, localhost only) ──────────────────────
+
+def _dash_rows(sql: str, params: tuple = ()) -> list:
+    try:
+        with db() as c:
+            return c.execute(sql, params).fetchall()
+    except Exception as e:
+        log.error("dashboard query failed: %s", e)
+        return []
+
+
+def _esc(s) -> str:
+    return html.escape(str(s if s is not None else ""))
+
+
+def _sentiment_bars() -> str:
+    """A tiny dependency-free bar chart of recent mood scores (-1..+1)."""
+    rows = _dash_rows(
+        "SELECT mood, score FROM sentiment_log ORDER BY id DESC LIMIT 30")
+    rows = list(reversed(rows))
+    if not rows:
+        return "<p class='muted'>No mood data yet.</p>"
+    bars = []
+    for r in rows:
+        score = float(r["score"] or 0)
+        h = int(max(4, min(60, (score + 1) / 2 * 60)))   # 0..60px
+        if score >= 0.15:
+            color = "#4caf50"
+        elif score <= -0.15:
+            color = "#e57373"
+        else:
+            color = "#90a4ae"
+        bars.append(
+            f"<span class='bar' style='height:{h}px;background:{color}' "
+            f"title='{_esc(r['mood'])} ({score:+.2f})'></span>")
+    return "<div class='chart'>" + "".join(bars) + "</div>"
+
+
+def dashboard_html() -> str:
+    up = int(time.time() - START_TIME)
+    h, rem = divmod(up, 3600)
+    m, _ = divmod(rem, 60)
+    last_seen = int(time.time() - _last_poll_ts)
+    msgs_ok = messages_app_running()
+
+    chats = _dash_rows(
+        "SELECT ts, role, content FROM chat_history ORDER BY id DESC LIMIT 25")
+    tasks = _dash_rows("SELECT id, text FROM tasks WHERE done=0 ORDER BY id DESC")
+    goals = _dash_rows("SELECT text FROM goals WHERE done=0 ORDER BY id DESC")
+    facts = _dash_rows("SELECT fact FROM memories ORDER BY id DESC LIMIT 20")
+    insights = _dash_rows("SELECT ts, insight FROM insights ORDER BY id DESC LIMIT 10")
+    blocked = _dash_rows(
+        "SELECT ts, handle, text FROM security_log ORDER BY id DESC LIMIT 10")
+
+    def chat_bubble(r):
+        who = "you" if r["role"] == "user" else "jarvis"
+        return (f"<div class='msg {who}'><div class='meta'>{_esc(r['ts'])}</div>"
+                f"<div class='body'>{_esc(r['content'])}</div></div>")
+
+    chat_html = "".join(chat_bubble(r) for r in reversed(chats)) or \
+        "<p class='muted'>No conversation yet.</p>"
+    tasks_html = "".join(f"<li>#{r['id']} {_esc(r['text'])}</li>" for r in tasks) or \
+        "<li class='muted'>none</li>"
+    goals_html = "".join(f"<li>{_esc(r['text'])}</li>" for r in goals) or \
+        "<li class='muted'>none</li>"
+    facts_html = "".join(f"<li>{_esc(r['fact'])}</li>" for r in facts) or \
+        "<li class='muted'>none</li>"
+    insights_html = "".join(
+        f"<li><span class='meta'>{_esc(r['ts'])}</span> {_esc(r['insight'])}</li>"
+        for r in insights) or "<li class='muted'>none yet</li>"
+    blocked_html = "".join(
+        f"<li><span class='meta'>{_esc(r['ts'])}</span> "
+        f"<b>{_esc(r['handle'])}</b>: {_esc(r['text'][:60])}</li>"
+        for r in blocked) or "<li class='muted'>none — only your number can reach JARVIS</li>"
+
+    dot = "#4caf50" if msgs_ok and last_seen < 30 else "#e57373"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>JARVIS</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; font-family:-apple-system,Helvetica,Arial,sans-serif;
+         background:#0d1117; color:#e6edf3; }}
+  header {{ padding:18px 24px; background:#161b22; border-bottom:1px solid #30363d;
+            display:flex; align-items:center; gap:14px; position:sticky; top:0; }}
+  header h1 {{ font-size:20px; margin:0; letter-spacing:2px; }}
+  .pulse {{ width:12px; height:12px; border-radius:50%; background:{dot};
+            box-shadow:0 0 12px {dot}; animation:p 2s infinite; }}
+  @keyframes p {{ 0%,100%{{opacity:1}} 50%{{opacity:.4}} }}
+  .stat {{ font-size:13px; color:#8b949e; margin-left:auto; text-align:right;
+           line-height:1.5; }}
+  .wrap {{ display:grid; grid-template-columns:1.4fr 1fr; gap:18px; padding:18px 24px; }}
+  @media(max-width:760px) {{ .wrap {{ grid-template-columns:1fr; }} }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:12px;
+           padding:16px; margin-bottom:18px; }}
+  .card h2 {{ font-size:13px; text-transform:uppercase; letter-spacing:1px;
+              color:#8b949e; margin:0 0 12px; }}
+  ul {{ margin:0; padding-left:18px; line-height:1.7; }}
+  .muted {{ color:#6e7681; }}
+  .meta {{ font-size:11px; color:#6e7681; }}
+  .chat {{ max-height:520px; overflow:auto; display:flex; flex-direction:column; gap:10px; }}
+  .msg {{ max-width:85%; padding:8px 12px; border-radius:14px; }}
+  .msg.you {{ align-self:flex-end; background:#1f6feb; }}
+  .msg.jarvis {{ align-self:flex-start; background:#21262d; border:1px solid #30363d; }}
+  .msg .body {{ white-space:pre-wrap; word-break:break-word; }}
+  .chart {{ display:flex; align-items:flex-end; gap:3px; height:64px; }}
+  .bar {{ width:8px; border-radius:2px; }}
+</style></head>
+<body>
+<header>
+  <span class="pulse"></span>
+  <h1>J.A.R.V.I.S</h1>
+  <div class="stat">
+    Uptime {h}h {m}m · last poll {last_seen}s ago<br>
+    {CEREBRAS_MODEL} · Messages.app {"✅" if msgs_ok else "⚠️ off"}
+  </div>
+</header>
+<div class="wrap">
+  <div>
+    <div class="card"><h2>Conversation</h2><div class="chat">{chat_html}</div></div>
+  </div>
+  <div>
+    <div class="card"><h2>Mood (last 30 msgs)</h2>{_sentiment_bars()}</div>
+    <div class="card"><h2>Open tasks</h2><ul>{tasks_html}</ul></div>
+    <div class="card"><h2>Goals</h2><ul>{goals_html}</ul></div>
+    <div class="card"><h2>What JARVIS knows</h2><ul>{facts_html}</ul></div>
+    <div class="card"><h2>Recent insights</h2><ul>{insights_html}</ul></div>
+    <div class="card"><h2>🔒 Blocked contact attempts</h2><ul>{blocked_html}</ul></div>
+  </div>
+</div>
+</body></html>"""
+
+
+class _DashHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/index.html"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            body = dashboard_html().encode("utf-8")
+        except Exception as e:
+            body = f"dashboard error: {e}".encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):  # silence default stderr request logging
+        pass
+
+
+def start_dashboard():
+    """Serve the dashboard on 127.0.0.1 only (never exposed to the network)
+    in a daemon thread so it can't block or crash the poll loop."""
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), _DashHandler)
+    except Exception as e:
+        log.warning("dashboard not started (port %s busy?): %s", DASHBOARD_PORT, e)
+        return
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    log.info("Dashboard live at http://localhost:%s", DASHBOARD_PORT)
+
+
+# ── Main loop with crash recovery ───────────────────────────────────────────────
+
+def handle_incoming(text: str) -> str:
+    if text.strip().startswith("/"):
+        return handle_command(text)
+    return chat(text)
+
+
+def setup_schedules():
+    scheduler.add_listener(_on_job_error, EVENT_JOB_ERROR)
+    jobs = [
+        (safe_job(morning_briefing), "cron", dict(hour=8, minute=0), "morning"),
+        (safe_job(evening_review), "cron", dict(hour=21, minute=0), "evening"),
+        (safe_job(self_evolve), "interval", dict(hours=6), "evolve"),
+        (safe_job(weekly_review), "cron",
+         dict(day_of_week="sun", hour=18, minute=0), "weekly"),
+        (safe_job(proactive_nudge), "cron", dict(hour=18, minute=30), "nudge"),
+        (safe_job(prune_old_data), "cron", dict(hour=4, minute=0), "prune"),
+        (safe_job(ensure_messages_running), "interval", dict(minutes=5), "watchdog"),
+    ]
+    for fn, trigger, kw, jid in jobs:
+        scheduler.add_job(fn, trigger, id=jid, replace_existing=True, **kw)
+    if not scheduler.running:
+        scheduler.start()
+
+
+def poll_loop():
+    """The single retried unit: seed the high-water mark, then poll forever."""
+    global _last_poll_ts
+    last_rowid = get_last_rowid()   # None until we've successfully seeded
+    while True:
+        _last_poll_ts = time.time()
+        if last_rowid is None:
+            # First run: skip existing history. If chat.db can't be read yet
+            # (no Full Disk Access), keep retrying rather than replaying all.
+            seed = newest_rowid()
+            if seed is None:
+                time.sleep(POLL_INTERVAL)
+                continue
+            last_rowid = seed
+            set_last_rowid(last_rowid)
+        for rowid, handle, body in poll_new_messages(last_rowid):
+            last_rowid = rowid
+            set_last_rowid(rowid)
+            if not is_allowed_sender(handle):
+                flag_unauthorized(handle, body)
+                continue
+            wake_screen()
+            log.info("← %s", body)
+            try:
+                reply = handle_incoming(body)
+            except Exception as e:
+                log.error("handler error: %s\n%s", e, traceback.format_exc())
+                reply = f"Something went wrong handling that: {e}"
+            deliver(reply)
+        time.sleep(POLL_INTERVAL)
+
+
+def main():
+    init_db()
+    stay_awake()
+    ensure_messages_running()
+    start_dashboard()
+    setup_schedules()
+    deliver("JARVIS online. Watching your iMessages — say hi or /help.")
+    backoff = 5
+    while True:
+        try:
+            poll_loop()
+        except KeyboardInterrupt:
+            log.info("Shutting down.")
+            return
+        except Exception as e:
+            log.error("FATAL: %s\n%s", e, traceback.format_exc())
+            try:
+                send_imessage(f"⚠️ JARVIS crashed: {e}. Restarting in {backoff}s.")
+            except Exception:
+                pass
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+
+
+if __name__ == "__main__":
+    main()
