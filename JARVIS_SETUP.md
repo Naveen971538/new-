@@ -9,7 +9,10 @@ iMessage, and is powered by the free, fast **Cerebras** API.
 - Reads your iMessages from `~/Library/Messages/chat.db`, replies via AppleScript
 - Cerebras LLM brain with function/tool calling
 - Persistent SQLite memory (facts, tasks, goals, chat history, insights)
-- **Auto-wakes the Mac's display** the moment a message arrives (`caffeinate`)
+- **Stays awake the whole time it's running** — holds a `caffeinate` assertion
+  (system/disk/display sleep all blocked) for as long as JARVIS is alive, so it
+  keeps polling and replying even if you never touch the Mac. Also nudges the
+  display on the instant a message arrives.
 
 **Easy wins**
 - Location-aware morning briefing (IP geolocation + weather, no API key)

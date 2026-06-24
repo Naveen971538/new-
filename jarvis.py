@@ -97,6 +97,7 @@ scheduler = BackgroundScheduler()
 START_TIME = time.time()
 _last_poll_ts = START_TIME
 _send_lock = threading.Lock()   # serialise AppleScript sends across threads
+_caffeinate_proc: Optional[subprocess.Popen] = None  # keeps system/display awake
 
 logging.basicConfig(
     level=logging.INFO,
@@ -264,10 +265,29 @@ def _split(text: str, size: int) -> List[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
 
+def stay_awake():
+    """Hold a `caffeinate` assertion for JARVIS's whole lifetime so the iMac
+    never goes to system/disk/display sleep while it's running — a one-shot
+    `-t 5` burst (the old approach) only nudges the display awake for a few
+    seconds and does nothing if the machine has actually gone to sleep
+    between polls, which is why replies stopped when the screen was off.
+    `-w <pid>` ties the assertion to our own process so it dies with us;
+    launchd's KeepAlive then respawns both together on restart.
+    -d display, -i idle system sleep, -m disk sleep, -s system sleep (AC only,
+    fine for a desktop iMac that's always plugged in)."""
+    global _caffeinate_proc
+    try:
+        _caffeinate_proc = subprocess.Popen(
+            ["caffeinate", "-dims", "-w", str(os.getpid())]
+        )
+    except Exception as e:
+        log.warning("stay_awake failed: %s", e)
+
+
 def wake_screen():
-    """Wake the display + reset the idle-sleep timer so messages are seen
-    even when the screen is off. `-u` simulates user activity; `-t` keeps it
-    awake briefly so the wake actually registers."""
+    """Nudge the display on immediately when a message arrives, on top of
+    the standing stay_awake() assertion (display sleep can still dim/blank
+    the screen even while the system itself stays up)."""
     try:
         subprocess.Popen(["caffeinate", "-u", "-t", "5"])
     except Exception as e:
@@ -1145,6 +1165,7 @@ def poll_loop():
 
 def main():
     init_db()
+    stay_awake()
     setup_schedules()
     deliver("JARVIS online. Watching your iMessages — say hi or /help.")
     backoff = 5
