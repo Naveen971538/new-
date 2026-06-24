@@ -19,6 +19,8 @@ iMessage, and is powered by the free, fast **Cerebras** API.
 - Voice replies via macOS `say` (toggle with `/voice on`)
 - `/screenshot` — captures the Mac screen and sends it back over iMessage
 - Clipboard bridge — `/clipboard` to read, `/copy <text>` to write
+- `/open <app|url|path>` — launch an app, open a link, or open a file remotely
+- `/find <query>` — Spotlight search the Mac for files by name
 
 **Productivity**
 - Calendar.app integration (add/list events)
@@ -34,7 +36,10 @@ iMessage, and is powered by the free, fast **Cerebras** API.
 
 **Reliability**
 - Crash auto-recovery loop + iMessage crash alert (works with launchd KeepAlive)
-- `/status` health check (uptime, last poll, DB size, counts)
+- Messages.app watchdog — auto-relaunches it if it ever quits/crashes (checked
+  every 5 min and at startup), since a dead Messages.app means silent send failures
+- `/status` health check (uptime, last poll, DB size, disk free, Messages.app
+  state, Wi-Fi network, counts)
 
 ## One-time setup on the Mac
 
@@ -88,4 +93,4 @@ launchctl load ~/Library/LaunchAgents/com.jarvis.bot.plist
 ## Commands
 `/help /status /tasks /task /done /goals /goal /remember /recall /weather
 /screenshot /clipboard /copy /voice /say /calendar /remind /mail /briefing
-/review /evolve` — anything else is a normal chat.
+/review /evolve /open /find` — anything else is a normal chat.

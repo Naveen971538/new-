@@ -316,6 +316,79 @@ def clipboard_write(text: str):
     subprocess.run(["pbcopy"], input=text, text=True, timeout=10)
 
 
+def open_target(target: str) -> str:
+    """Launch an app by name or open a URL/file path via the `open` command
+    (e.g. 'Safari', 'https://...', '/Users/me/file.pdf')."""
+    if not target:
+        return "Usage: /open <app name, URL, or file path>"
+    try:
+        is_app = "://" not in target and not target.startswith("/") and "." not in target.split("/")[-1]
+        cmd = ["open", "-a", target] if is_app else ["open", target]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode != 0:
+            return f"Couldn't open '{target}': {res.stderr.strip() or 'not found'}"
+        return f"Opened {target}."
+    except Exception as e:
+        return f"Couldn't open '{target}': {e}"
+
+
+def find_files(query: str, limit: int = 8) -> str:
+    """Spotlight search via mdfind — no indexing/daemons to install, it's
+    already running as part of macOS."""
+    if not query:
+        return "Usage: /find <search term>"
+    try:
+        res = subprocess.run(
+            ["mdfind", "-name", query], capture_output=True, text=True, timeout=15
+        )
+        hits = [l for l in res.stdout.splitlines() if l.strip()][:limit]
+        if not hits:
+            return f"No files found matching '{query}'."
+        return f"Found {len(hits)} (showing up to {limit}):\n" + "\n".join(hits)
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
+def wifi_network() -> str:
+    try:
+        res = subprocess.run(
+            ["networksetup", "-getairportnetwork", "en0"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return res.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def disk_free_gb() -> Optional[float]:
+    try:
+        res = subprocess.run(["df", "-g", "/"], capture_output=True, text=True, timeout=10)
+        line = res.stdout.strip().splitlines()[-1]
+        return float(line.split()[3])
+    except Exception:
+        return None
+
+
+def messages_app_running() -> bool:
+    res = subprocess.run(
+        ["pgrep", "-x", "Messages"], capture_output=True, text=True, timeout=10
+    )
+    return res.returncode == 0
+
+
+def ensure_messages_running():
+    """Self-heal if Messages.app isn't running — without it, every send
+    silently fails. Relaunch quietly; only alert if it keeps happening."""
+    if messages_app_running():
+        return
+    log.warning("Messages.app not running — relaunching.")
+    try:
+        subprocess.run(["open", "-a", "Messages"], timeout=15)
+        time.sleep(3)
+    except Exception as e:
+        log.error("Failed to relaunch Messages.app: %s", e)
+
+
 # ── iMessage polling ────────────────────────────────────────────────────────────
 
 def poll_new_messages(since_rowid: int) -> List[Tuple[int, str]]:
@@ -707,6 +780,16 @@ TOOLS = [
         "name": "speak_aloud", "description": "Say text out loud on the Mac.",
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "open_target",
+        "description": "Launch an app by name, or open a URL/file path, on the Mac.",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string"}}, "required": ["target"]}}},
+    {"type": "function", "function": {
+        "name": "find_files",
+        "description": "Spotlight-search the Mac for files matching a name.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
 ]
 
 
@@ -748,6 +831,8 @@ TOOL_DISPATCH = {
     "get_clipboard": _tool_get_clipboard,
     "set_clipboard": _tool_set_clipboard,
     "speak_aloud": _tool_speak,
+    "open_target": open_target,
+    "find_files": find_files,
 }
 
 
@@ -860,6 +945,8 @@ HELP = """JARVIS commands:
 /mail — summarise unread mail
 /briefing — morning briefing now   ·  /review — weekly review now
 /evolve — run self-evolution now
+/open <app|url|path> — launch an app, URL, or file on the Mac
+/find <query> — Spotlight search for files on the Mac
 Anything else is a normal chat with JARVIS."""
 
 
@@ -920,6 +1007,10 @@ def handle_command(text: str) -> str:
     if cmd == "/evolve":
         self_evolve()
         return "Evolution complete."
+    if cmd == "/open":
+        return open_target(arg)
+    if cmd == "/find":
+        return find_files(arg)
     return f"Unknown command. {HELP}"
 
 
@@ -1096,6 +1187,8 @@ def status_report() -> str:
     m, s = divmod(rem, 60)
     db_kb = os.path.getsize(DB_PATH) // 1024 if os.path.exists(DB_PATH) else 0
     last_seen = int(time.time() - _last_poll_ts)
+    free_gb = disk_free_gb()
+    disk_line = f"Disk free: {free_gb:.1f}GB\n" if free_gb is not None else ""
     return (
         "🟢 JARVIS status\n"
         f"Uptime: {h}h {m}m {s}s\n"
@@ -1105,6 +1198,9 @@ def status_report() -> str:
         f"Memories: {_count('SELECT COUNT(*) FROM memories')}\n"
         f"Insights: {_count('SELECT COUNT(*) FROM insights')}\n"
         f"DB size: {db_kb} KB\n"
+        f"{disk_line}"
+        f"Messages.app: {'running' if messages_app_running() else '⚠️ NOT running'}\n"
+        f"Wi-Fi: {wifi_network()}\n"
         f"Voice: {get_setting('voice', 'off')}"
     )
 
@@ -1127,6 +1223,7 @@ def setup_schedules():
          dict(day_of_week="sun", hour=18, minute=0), "weekly"),
         (safe_job(proactive_nudge), "cron", dict(hour=18, minute=30), "nudge"),
         (safe_job(prune_old_data), "cron", dict(hour=4, minute=0), "prune"),
+        (safe_job(ensure_messages_running), "interval", dict(minutes=5), "watchdog"),
     ]
     for fn, trigger, kw, jid in jobs:
         scheduler.add_job(fn, trigger, id=jid, replace_existing=True, **kw)
@@ -1166,6 +1263,7 @@ def poll_loop():
 def main():
     init_db()
     stay_awake()
+    ensure_messages_running()
     setup_schedules()
     deliver("JARVIS online. Watching your iMessages — say hi or /help.")
     backoff = 5
