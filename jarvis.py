@@ -43,6 +43,7 @@ Setup (.env in ~/jarvis/.env)
   CEREBRAS_MODEL=llama-3.3-70b
 """
 
+import html
 import inspect
 import json
 import logging
@@ -56,6 +57,7 @@ import traceback
 import urllib.parse
 import urllib.request
 from contextlib import closing, contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -83,6 +85,7 @@ POLL_INTERVAL = 2          # seconds between iMessage checks
 HISTORY_TURNS = 16         # how many past messages to feed the model
 MAX_TOOL_HOPS = 6          # safety cap on tool-call loops
 HTTP_TIMEOUT = 12          # seconds for outbound web requests
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8787"))  # local web UI
 
 JARVIS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -947,6 +950,7 @@ HELP = """JARVIS commands:
 /evolve — run self-evolution now
 /open <app|url|path> — launch an app, URL, or file on the Mac
 /find <query> — Spotlight search for files on the Mac
+/dashboard — open the live visual dashboard in your browser
 Anything else is a normal chat with JARVIS."""
 
 
@@ -1011,6 +1015,10 @@ def handle_command(text: str) -> str:
         return open_target(arg)
     if cmd == "/find":
         return find_files(arg)
+    if cmd == "/dashboard":
+        url = f"http://localhost:{DASHBOARD_PORT}"
+        subprocess.Popen(["open", url])
+        return f"🖥️ Opening the JARVIS dashboard: {url}"
     return f"Unknown command. {HELP}"
 
 
@@ -1205,6 +1213,168 @@ def status_report() -> str:
     )
 
 
+# ── Live web dashboard (stdlib http.server, localhost only) ──────────────────────
+
+def _dash_rows(sql: str, params: tuple = ()) -> list:
+    try:
+        with db() as c:
+            return c.execute(sql, params).fetchall()
+    except Exception as e:
+        log.error("dashboard query failed: %s", e)
+        return []
+
+
+def _esc(s) -> str:
+    return html.escape(str(s if s is not None else ""))
+
+
+def _sentiment_bars() -> str:
+    """A tiny dependency-free bar chart of recent mood scores (-1..+1)."""
+    rows = _dash_rows(
+        "SELECT mood, score FROM sentiment_log ORDER BY id DESC LIMIT 30")
+    rows = list(reversed(rows))
+    if not rows:
+        return "<p class='muted'>No mood data yet.</p>"
+    bars = []
+    for r in rows:
+        score = float(r["score"] or 0)
+        h = int(max(4, min(60, (score + 1) / 2 * 60)))   # 0..60px
+        if score >= 0.15:
+            color = "#4caf50"
+        elif score <= -0.15:
+            color = "#e57373"
+        else:
+            color = "#90a4ae"
+        bars.append(
+            f"<span class='bar' style='height:{h}px;background:{color}' "
+            f"title='{_esc(r['mood'])} ({score:+.2f})'></span>")
+    return "<div class='chart'>" + "".join(bars) + "</div>"
+
+
+def dashboard_html() -> str:
+    up = int(time.time() - START_TIME)
+    h, rem = divmod(up, 3600)
+    m, _ = divmod(rem, 60)
+    last_seen = int(time.time() - _last_poll_ts)
+    msgs_ok = messages_app_running()
+
+    chats = _dash_rows(
+        "SELECT ts, role, content FROM chat_history ORDER BY id DESC LIMIT 25")
+    tasks = _dash_rows("SELECT id, text FROM tasks WHERE done=0 ORDER BY id DESC")
+    goals = _dash_rows("SELECT text FROM goals WHERE done=0 ORDER BY id DESC")
+    facts = _dash_rows("SELECT fact FROM memories ORDER BY id DESC LIMIT 20")
+    insights = _dash_rows("SELECT ts, insight FROM insights ORDER BY id DESC LIMIT 10")
+
+    def chat_bubble(r):
+        who = "you" if r["role"] == "user" else "jarvis"
+        return (f"<div class='msg {who}'><div class='meta'>{_esc(r['ts'])}</div>"
+                f"<div class='body'>{_esc(r['content'])}</div></div>")
+
+    chat_html = "".join(chat_bubble(r) for r in reversed(chats)) or \
+        "<p class='muted'>No conversation yet.</p>"
+    tasks_html = "".join(f"<li>#{r['id']} {_esc(r['text'])}</li>" for r in tasks) or \
+        "<li class='muted'>none</li>"
+    goals_html = "".join(f"<li>{_esc(r['text'])}</li>" for r in goals) or \
+        "<li class='muted'>none</li>"
+    facts_html = "".join(f"<li>{_esc(r['fact'])}</li>" for r in facts) or \
+        "<li class='muted'>none</li>"
+    insights_html = "".join(
+        f"<li><span class='meta'>{_esc(r['ts'])}</span> {_esc(r['insight'])}</li>"
+        for r in insights) or "<li class='muted'>none yet</li>"
+
+    dot = "#4caf50" if msgs_ok and last_seen < 30 else "#e57373"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>JARVIS</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; font-family:-apple-system,Helvetica,Arial,sans-serif;
+         background:#0d1117; color:#e6edf3; }}
+  header {{ padding:18px 24px; background:#161b22; border-bottom:1px solid #30363d;
+            display:flex; align-items:center; gap:14px; position:sticky; top:0; }}
+  header h1 {{ font-size:20px; margin:0; letter-spacing:2px; }}
+  .pulse {{ width:12px; height:12px; border-radius:50%; background:{dot};
+            box-shadow:0 0 12px {dot}; animation:p 2s infinite; }}
+  @keyframes p {{ 0%,100%{{opacity:1}} 50%{{opacity:.4}} }}
+  .stat {{ font-size:13px; color:#8b949e; margin-left:auto; text-align:right;
+           line-height:1.5; }}
+  .wrap {{ display:grid; grid-template-columns:1.4fr 1fr; gap:18px; padding:18px 24px; }}
+  @media(max-width:760px) {{ .wrap {{ grid-template-columns:1fr; }} }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:12px;
+           padding:16px; margin-bottom:18px; }}
+  .card h2 {{ font-size:13px; text-transform:uppercase; letter-spacing:1px;
+              color:#8b949e; margin:0 0 12px; }}
+  ul {{ margin:0; padding-left:18px; line-height:1.7; }}
+  .muted {{ color:#6e7681; }}
+  .meta {{ font-size:11px; color:#6e7681; }}
+  .chat {{ max-height:520px; overflow:auto; display:flex; flex-direction:column; gap:10px; }}
+  .msg {{ max-width:85%; padding:8px 12px; border-radius:14px; }}
+  .msg.you {{ align-self:flex-end; background:#1f6feb; }}
+  .msg.jarvis {{ align-self:flex-start; background:#21262d; border:1px solid #30363d; }}
+  .msg .body {{ white-space:pre-wrap; word-break:break-word; }}
+  .chart {{ display:flex; align-items:flex-end; gap:3px; height:64px; }}
+  .bar {{ width:8px; border-radius:2px; }}
+</style></head>
+<body>
+<header>
+  <span class="pulse"></span>
+  <h1>J.A.R.V.I.S</h1>
+  <div class="stat">
+    Uptime {h}h {m}m · last poll {last_seen}s ago<br>
+    {CEREBRAS_MODEL} · Messages.app {"✅" if msgs_ok else "⚠️ off"}
+  </div>
+</header>
+<div class="wrap">
+  <div>
+    <div class="card"><h2>Conversation</h2><div class="chat">{chat_html}</div></div>
+  </div>
+  <div>
+    <div class="card"><h2>Mood (last 30 msgs)</h2>{_sentiment_bars()}</div>
+    <div class="card"><h2>Open tasks</h2><ul>{tasks_html}</ul></div>
+    <div class="card"><h2>Goals</h2><ul>{goals_html}</ul></div>
+    <div class="card"><h2>What JARVIS knows</h2><ul>{facts_html}</ul></div>
+    <div class="card"><h2>Recent insights</h2><ul>{insights_html}</ul></div>
+  </div>
+</div>
+</body></html>"""
+
+
+class _DashHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/index.html"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            body = dashboard_html().encode("utf-8")
+        except Exception as e:
+            body = f"dashboard error: {e}".encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):  # silence default stderr request logging
+        pass
+
+
+def start_dashboard():
+    """Serve the dashboard on 127.0.0.1 only (never exposed to the network)
+    in a daemon thread so it can't block or crash the poll loop."""
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), _DashHandler)
+    except Exception as e:
+        log.warning("dashboard not started (port %s busy?): %s", DASHBOARD_PORT, e)
+        return
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    log.info("Dashboard live at http://localhost:%s", DASHBOARD_PORT)
+
+
 # ── Main loop with crash recovery ───────────────────────────────────────────────
 
 def handle_incoming(text: str) -> str:
@@ -1264,6 +1434,7 @@ def main():
     init_db()
     stay_awake()
     ensure_messages_running()
+    start_dashboard()
     setup_schedules()
     deliver("JARVIS online. Watching your iMessages — say hi or /help.")
     backoff = 5

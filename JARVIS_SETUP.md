@@ -21,6 +21,11 @@ iMessage, and is powered by the free, fast **Cerebras** API.
 - Clipboard bridge — `/clipboard` to read, `/copy <text>` to write
 - `/open <app|url|path>` — launch an app, open a link, or open a file remotely
 - `/find <query>` — Spotlight search the Mac for files by name
+- **Live visual dashboard** — a dark, auto-refreshing web UI at
+  `http://localhost:8787` showing the conversation, mood chart, open tasks,
+  goals, what JARVIS knows about you, and recent insights. Pure stdlib
+  `http.server`, bound to localhost only (never exposed to the network).
+  Open it any time with `/dashboard`.
 
 **Productivity**
 - Calendar.app integration (add/list events)
@@ -93,4 +98,4 @@ launchctl load ~/Library/LaunchAgents/com.jarvis.bot.plist
 ## Commands
 `/help /status /tasks /task /done /goals /goal /remember /recall /weather
 /screenshot /clipboard /copy /voice /say /calendar /remind /mail /briefing
-/review /evolve /open /find` — anything else is a normal chat.
+/review /evolve /open /find /dashboard` — anything else is a normal chat.
