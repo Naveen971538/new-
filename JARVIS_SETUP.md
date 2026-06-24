@@ -130,5 +130,6 @@ cp ~/jarvis/jarvis.py.bak ~/jarvis/jarvis.py && bash ~/jarvis/update.sh
 
 ## Commands
 `/help /status /tasks /task /done /goals /goal /remember /recall /weather
-/screenshot /clipboard /copy /voice /say /calendar /remind /mail /briefing
-/review /evolve /open /find /dashboard /security` — anything else is a normal chat.
+/screenshot /clipboard /copy /voice /say /calendar /setcalendar /delevent
+/remind /mail /briefing /review /evolve /open /find /dashboard /security` —
+anything else is a normal chat.

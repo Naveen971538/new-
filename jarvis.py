@@ -640,6 +640,29 @@ end run
 """
 
 
+_CAL_DELETE = """
+on run {whichDay, titleMatch}
+    set startD to current date
+    set hours of startD to 0
+    set minutes of startD to 0
+    set seconds of startD to 0
+    if whichDay is "tomorrow" then set startD to startD + (1 * days)
+    set endD to startD + (1 * days)
+    set deleted to 0
+    tell application "Calendar"
+        repeat with cal in calendars
+            set evs to (every event of cal whose start date is greater than or equal to startD and start date is less than endD and summary contains titleMatch)
+            repeat with ev in evs
+                delete ev
+                set deleted to deleted + 1
+            end repeat
+        end repeat
+    end tell
+    return deleted as string
+end run
+"""
+
+
 def add_calendar_event(title: str, when_iso: str, duration_min: int = 60,
                        calendar_name: str = "") -> str:
     """when_iso: 'YYYY-MM-DD HH:MM'."""
@@ -663,6 +686,28 @@ def list_calendar_events(which_day: str = "today") -> str:
     if res.returncode != 0:
         return f"(calendar unavailable: {res.stderr.strip()})"
     return res.stdout.strip() or f"No events {which_day}."
+
+
+def delete_calendar_event(title_match: str, which_day: str = "today") -> str:
+    """Delete event(s) on which_day whose title CONTAINS title_match.
+    Matches by substring across all calendars, so be specific."""
+    if not title_match.strip():
+        return "Usage: /delevent <day: today|tomorrow> <title text to match>"
+    res = run_osascript(_CAL_DELETE, which_day, title_match)
+    if res.returncode != 0:
+        return f"Couldn't delete event: {res.stderr.strip()}"
+    n = res.stdout.strip()
+    if n == "0":
+        return f"No {which_day} event matching '{title_match}' found."
+    return f"Deleted {n} event(s) matching '{title_match}' ({which_day})."
+
+
+def set_calendar_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return "Usage: /setcalendar <calendar name>"
+    set_setting("calendar_name", name)
+    return f"OK — new events will be added to the '{name}' calendar."
 
 
 def add_reminder(text: str) -> str:
@@ -837,6 +882,18 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "which_day": {"type": "string"}}}}},
     {"type": "function", "function": {
+        "name": "delete_calendar_event",
+        "description": "Delete Calendar.app event(s) on a day whose title contains title_match.",
+        "parameters": {"type": "object", "properties": {
+            "title_match": {"type": "string"},
+            "which_day": {"type": "string"}},
+            "required": ["title_match"]}}},
+    {"type": "function", "function": {
+        "name": "set_calendar_name",
+        "description": "Set which Calendar.app calendar new events are added to.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
         "name": "add_reminder", "description": "Add an Apple Reminders reminder.",
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string"}}, "required": ["text"]}}},
@@ -903,6 +960,8 @@ TOOL_DISPATCH = {
     "get_weather": get_weather,
     "add_calendar_event": add_calendar_event,
     "list_calendar_events": list_calendar_events,
+    "delete_calendar_event": delete_calendar_event,
+    "set_calendar_name": set_calendar_name,
     "add_reminder": add_reminder,
     "summarize_mail": lambda: summarize_mail(10),
     "take_screenshot": _tool_screenshot,
@@ -1020,6 +1079,8 @@ HELP = """JARVIS commands:
 /clipboard — read clipboard   ·  /copy <text> — write clipboard
 /voice on|off — toggle spoken replies   ·  /say <text> — speak aloud
 /calendar [today|tomorrow] — list events   ·  /remind <text> — Apple reminder
+/delevent <today|tomorrow> <title text> — delete matching event(s)
+/setcalendar <name> — set which calendar new events are added to
 /mail — summarise unread mail
 /briefing — morning briefing now   ·  /review — weekly review now
 /evolve — run self-evolution now
@@ -1074,6 +1135,13 @@ def handle_command(text: str) -> str:
         return "🔊"
     if cmd == "/calendar":
         return list_calendar_events(arg or "today")
+    if cmd == "/setcalendar":
+        return set_calendar_name(arg)
+    if cmd == "/delevent":
+        dparts = arg.split(maxsplit=1)
+        if len(dparts) == 2 and dparts[0].lower() in ("today", "tomorrow"):
+            return delete_calendar_event(dparts[1], dparts[0].lower())
+        return delete_calendar_event(arg, "today")
     if cmd == "/remind":
         return add_reminder(arg) if arg else "Usage: /remind <text>"
     if cmd == "/mail":
