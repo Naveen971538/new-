@@ -47,6 +47,17 @@ err() { printf 'FAIL  %s\n' "$*" 1>&2; }
 # Is the launchd job currently registered (loaded) under our label?
 label_loaded() { launchctl list 2>/dev/null | grep -q "$LABEL"; }
 
+# Is JARVIS actually up right now? launchd job if a plist is installed,
+# otherwise a live manual python process. Used so the updater can (re)start a
+# DOWN bot even when the code hasn't changed.
+bot_running() {
+    if [ -f "$PLIST" ]; then
+        label_loaded
+    else
+        [ -n "`jarvis_pids`" ]
+    fi
+}
+
 # Is a real python jarvis.py process alive? Matches every launch form:
 #   /usr/local/bin/python3.9 /Users/x/jarvis/jarvis.py   (launchd / absolute)
 #   python3.9 jarvis.py                                   (manual, relative)
@@ -136,60 +147,72 @@ if ! "$PY" -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec"
 fi
 ok "Download verified."
 
-# --- 3. Skip work if identical (idempotent / no needless restart) ------------
+# --- 3. Decide whether the code actually changed -----------------------------
 
+NEW_CODE=1
 if [ -f "$TARGET" ] && cmp -s "$TMP" "$TARGET"; then
-    ok "Already up to date — jarvis.py is unchanged."
-    say "Nothing to install; not restarting a healthy bot."
-    exit 0
+    NEW_CODE=0
 fi
 
-# --- 4. Back up the current copy, then atomically install --------------------
+if [ "$NEW_CODE" -eq 0 ]; then
+    # Code is already the latest. Only bother (re)starting if JARVIS is actually
+    # DOWN — that makes `update-jarvis` double as a "make sure it's running"
+    # command. If it's both current AND running, there's nothing to do.
+    if bot_running; then
+        ok "Already up to date and JARVIS is running. Nothing to do."
+        exit 0
+    fi
+    say "Code is already current, but JARVIS isn't running — starting it ..."
+fi
 
-if [ -f "$TARGET" ]; then
-    if cp -p "$TARGET" "$BACKUP"; then
-        ok "Backed up previous version -> $BACKUP"
-    else
-        err "Could not write backup at $BACKUP. Aborting to stay safe."
+# --- 4. Back up the current copy, then atomically install (only on change) ---
+
+if [ "$NEW_CODE" -eq 1 ]; then
+    if [ -f "$TARGET" ]; then
+        if cp -p "$TARGET" "$BACKUP"; then
+            ok "Backed up previous version -> $BACKUP"
+        else
+            err "Could not write backup at $BACKUP. Aborting to stay safe."
+            exit 1
+        fi
+    fi
+
+    # Atomic install: copy to a sibling temp in the SAME dir, then mv (rename
+    # within one filesystem is atomic) so jarvis.py is never half-written.
+    STAGE="${APP_DIR}/.jarvis.py.new.$$"
+    if ! cp "$TMP" "$STAGE"; then
+        err "Could not stage new file in $APP_DIR (disk full?). Aborting; old version intact."
+        rm -f "$STAGE" 2>/dev/null
         exit 1
     fi
-fi
-
-# Atomic install: copy to a sibling temp in the SAME dir, then mv (rename
-# within one filesystem is atomic) so jarvis.py is never half-written.
-STAGE="${APP_DIR}/.jarvis.py.new.$$"
-if ! cp "$TMP" "$STAGE"; then
-    err "Could not stage new file in $APP_DIR (disk full?). Aborting; old version intact."
-    rm -f "$STAGE" 2>/dev/null
-    exit 1
-fi
-# Confirm the staged bytes are byte-identical to the validated download —
-# closes the gap where a short write (disk full) installs unvalidated bytes.
-if ! cmp -s "$TMP" "$STAGE"; then
-    err "Staged copy differs from the verified download (disk full?). Aborting; old version intact."
-    rm -f "$STAGE" 2>/dev/null
-    exit 1
-fi
-chmod 644 "$STAGE" 2>/dev/null
-if ! mv -f "$STAGE" "$TARGET"; then
-    err "Could not move new file into place. Attempting to restore backup ..."
-    if [ -f "$BACKUP" ]; then
-        if cp -p "$BACKUP" "$TARGET"; then
-            err "Restored previous jarvis.py from backup. Update aborted; bot unchanged."
-        else
-            err "RESTORE FAILED. JARVIS MAY BE DOWN. Manually run:"
-            err "    cp \"$BACKUP\" \"$TARGET\""
-        fi
-    else
-        err "No backup exists (first run). JARVIS MAY HAVE NO CODE. Re-run the updater."
+    # Confirm the staged bytes are byte-identical to the validated download —
+    # closes the gap where a short write (disk full) installs unvalidated bytes.
+    if ! cmp -s "$TMP" "$STAGE"; then
+        err "Staged copy differs from the verified download (disk full?). Aborting; old version intact."
+        rm -f "$STAGE" 2>/dev/null
+        exit 1
     fi
-    rm -f "$STAGE" 2>/dev/null
-    exit 1
-fi
-ok "Installed new jarvis.py"
+    chmod 644 "$STAGE" 2>/dev/null
+    if ! mv -f "$STAGE" "$TARGET"; then
+        err "Could not move new file into place. Attempting to restore backup ..."
+        if [ -f "$BACKUP" ]; then
+            if cp -p "$BACKUP" "$TARGET"; then
+                err "Restored previous jarvis.py from backup. Update aborted; bot unchanged."
+            else
+                err "RESTORE FAILED. JARVIS MAY BE DOWN. Manually run:"
+                err "    cp \"$BACKUP\" \"$TARGET\""
+            fi
+        else
+            err "No backup exists (first run). JARVIS MAY HAVE NO CODE. Re-run the updater."
+        fi
+        rm -f "$STAGE" 2>/dev/null
+        exit 1
+    fi
+    ok "Installed new jarvis.py"
 
-# Drop any stale bytecode cache so the new code can't be shadowed.
-rm -rf "${APP_DIR}/__pycache__" 2>/dev/null
+    # Drop any stale bytecode cache so the new code can't be shadowed.
+    rm -rf "${APP_DIR}/__pycache__" 2>/dev/null
+fi
 
 # --- 5. Restart JARVIS -------------------------------------------------------
 #
