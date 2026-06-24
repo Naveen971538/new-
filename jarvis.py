@@ -48,6 +48,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -94,6 +95,74 @@ if not CEREBRAS_API_KEY or not MY_IMESSAGE_ID:
         "ERROR: CEREBRAS_API_KEY and MY_IMESSAGE_ID must be set in ~/jarvis/.env\n"
     )
     sys.exit(1)
+
+if "@" in MY_IMESSAGE_ID:
+    sys.stderr.write(
+        "WARNING: MY_IMESSAGE_ID looks like an email/Apple ID, not a phone "
+        "number. For phone-number-only access, set MY_IMESSAGE_ID in .env to "
+        "your phone number in international format, e.g. +14155551234\n"
+    )
+
+
+def _normalize_handle(h: str) -> str:
+    """Canonicalize an iMessage handle for comparison. Emails compare
+    case-insensitively; phone numbers compare by digits only, so formatting
+    differences (spaces, dashes, parens, leading 0 vs country code) don't
+    cause a false mismatch."""
+    h = (h or "").strip()
+    if "@" in h:
+        return h.lower()
+    return re.sub(r"\D", "", h)
+
+
+_ALLOWED_HANDLE = _normalize_handle(MY_IMESSAGE_ID)
+_ALLOWED_IS_PHONE = "@" not in MY_IMESSAGE_ID
+
+
+def is_allowed_sender(handle: str) -> bool:
+    """Strict allowlist: only the single configured phone number/Apple ID may
+    talk to JARVIS. Everyone else — including the same person's OTHER Apple ID
+    handle (e.g. their email) if it's not the one configured — is rejected."""
+    n = _normalize_handle(handle)
+    if not n:
+        return False
+    if n == _ALLOWED_HANDLE:
+        return True
+    # Phone fallback: tolerate a missing/extra country code by comparing the
+    # national number (last 10 digits) when both sides are phone numbers.
+    if _ALLOWED_IS_PHONE and "@" not in (handle or ""):
+        if len(n) >= 10 and len(_ALLOWED_HANDLE) >= 10:
+            return n[-10:] == _ALLOWED_HANDLE[-10:]
+    return False
+
+
+_alerted_handles = set()  # de-dupe security alerts within this process run
+
+
+def flag_unauthorized(handle: str, body: str):
+    """Log + alert on a message from anyone other than the allowed sender.
+    Never processed as a command and never replied to."""
+    log.warning("BLOCKED message from unauthorized handle %s: %r", handle, body[:120])
+    try:
+        with db() as c:
+            c.execute(
+                "INSERT INTO security_log(ts, handle, text) VALUES(?,?,?)",
+                (now(), handle, body[:500]),
+            )
+            c.commit()
+    except Exception as e:
+        log.error("failed to record security_log entry: %s", e)
+    if handle not in _alerted_handles:
+        _alerted_handles.add(handle)
+        try:
+            send_imessage(
+                f"🔒 JARVIS security: blocked a message from an unrecognized "
+                f"contact ({handle}). It was ignored, not processed. "
+                f"(Further messages from this contact won't alert again "
+                f"until JARVIS restarts.)"
+            )
+        except Exception:
+            pass
 
 client = OpenAI(api_key=CEREBRAS_API_KEY, base_url=CEREBRAS_BASE_URL)
 scheduler = BackgroundScheduler()
@@ -161,6 +230,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sentiment_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT, message TEXT, mood TEXT, score REAL);
+            CREATE TABLE IF NOT EXISTS security_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, handle TEXT, text TEXT);
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS state (
@@ -394,25 +466,28 @@ def ensure_messages_running():
 
 # ── iMessage polling ────────────────────────────────────────────────────────────
 
-def poll_new_messages(since_rowid: int) -> List[Tuple[int, str]]:
-    """Return [(rowid, text)] of incoming texts newer than since_rowid."""
+def poll_new_messages(since_rowid: int) -> List[Tuple[int, str, str]]:
+    """Return [(rowid, handle, text)] of ALL incoming texts newer than
+    since_rowid, from ANY sender. Deliberately not filtered to MY_IMESSAGE_ID
+    here — the allowlist check happens in poll_loop so messages from anyone
+    else can be logged/alerted as a possible intrusion attempt instead of
+    silently vanishing inside the SQL WHERE clause."""
     try:
         with closing(sqlite3.connect(
                 f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)) as conn:
             rows = conn.execute(
                 """
-                SELECT m.rowid AS rid, m.text AS body
+                SELECT m.rowid AS rid, h.id AS handle, m.text AS body
                 FROM   message m
                 JOIN   handle  h ON m.handle_id = h.rowid
                 WHERE  m.rowid > ?
                   AND  m.is_from_me = 0
                   AND  m.text IS NOT NULL
-                  AND  h.id = ?
                 ORDER  BY m.rowid
                 """,
-                (since_rowid, MY_IMESSAGE_ID),
+                (since_rowid,),
             ).fetchall()
-        return [(r[0], r[1]) for r in rows]
+        return [(r[0], r[1], r[2]) for r in rows]
     except sqlite3.OperationalError as e:
         # Almost always "unable to open database file" = no Full Disk Access.
         log.error("Cannot read chat.db (%s). Grant Terminal Full Disk Access.", e)
@@ -951,6 +1026,7 @@ HELP = """JARVIS commands:
 /open <app|url|path> — launch an app, URL, or file on the Mac
 /find <query> — Spotlight search for files on the Mac
 /dashboard — open the live visual dashboard in your browser
+/security — show recent blocked/unauthorized contact attempts
 Anything else is a normal chat with JARVIS."""
 
 
@@ -1019,6 +1095,8 @@ def handle_command(text: str) -> str:
         url = f"http://localhost:{DASHBOARD_PORT}"
         subprocess.Popen(["open", url])
         return f"🖥️ Opening the JARVIS dashboard: {url}"
+    if cmd == "/security":
+        return security_report()
     return f"Unknown command. {HELP}"
 
 
@@ -1213,6 +1291,26 @@ def status_report() -> str:
     )
 
 
+def security_report() -> str:
+    allowed = MY_IMESSAGE_ID
+    with db() as c:
+        rows = c.execute(
+            "SELECT ts, handle, text FROM security_log ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        total = c.execute("SELECT COUNT(*) FROM security_log").fetchone()[0]
+    if not rows:
+        return (
+            f"🔒 Security\nAllowed sender: {allowed}\n"
+            f"No unauthorized contact attempts recorded."
+        )
+    lines = [f"🔒 Security\nAllowed sender: {allowed}\n"
+             f"{total} blocked attempt(s) total. Most recent:"]
+    for r in rows:
+        preview = r["text"][:60] + ("…" if len(r["text"]) > 60 else "")
+        lines.append(f"  {r['ts']} — {r['handle']}: {preview!r}")
+    return "\n".join(lines)
+
+
 # ── Live web dashboard (stdlib http.server, localhost only) ──────────────────────
 
 def _dash_rows(sql: str, params: tuple = ()) -> list:
@@ -1264,6 +1362,8 @@ def dashboard_html() -> str:
     goals = _dash_rows("SELECT text FROM goals WHERE done=0 ORDER BY id DESC")
     facts = _dash_rows("SELECT fact FROM memories ORDER BY id DESC LIMIT 20")
     insights = _dash_rows("SELECT ts, insight FROM insights ORDER BY id DESC LIMIT 10")
+    blocked = _dash_rows(
+        "SELECT ts, handle, text FROM security_log ORDER BY id DESC LIMIT 10")
 
     def chat_bubble(r):
         who = "you" if r["role"] == "user" else "jarvis"
@@ -1281,6 +1381,10 @@ def dashboard_html() -> str:
     insights_html = "".join(
         f"<li><span class='meta'>{_esc(r['ts'])}</span> {_esc(r['insight'])}</li>"
         for r in insights) or "<li class='muted'>none yet</li>"
+    blocked_html = "".join(
+        f"<li><span class='meta'>{_esc(r['ts'])}</span> "
+        f"<b>{_esc(r['handle'])}</b>: {_esc(r['text'][:60])}</li>"
+        for r in blocked) or "<li class='muted'>none — only your number can reach JARVIS</li>"
 
     dot = "#4caf50" if msgs_ok and last_seen < 30 else "#e57373"
     return f"""<!DOCTYPE html>
@@ -1337,6 +1441,7 @@ def dashboard_html() -> str:
     <div class="card"><h2>Goals</h2><ul>{goals_html}</ul></div>
     <div class="card"><h2>What JARVIS knows</h2><ul>{facts_html}</ul></div>
     <div class="card"><h2>Recent insights</h2><ul>{insights_html}</ul></div>
+    <div class="card"><h2>🔒 Blocked contact attempts</h2><ul>{blocked_html}</ul></div>
   </div>
 </div>
 </body></html>"""
@@ -1416,9 +1521,12 @@ def poll_loop():
                 continue
             last_rowid = seed
             set_last_rowid(last_rowid)
-        for rowid, body in poll_new_messages(last_rowid):
+        for rowid, handle, body in poll_new_messages(last_rowid):
             last_rowid = rowid
             set_last_rowid(rowid)
+            if not is_allowed_sender(handle):
+                flag_unauthorized(handle, body)
+                continue
             wake_screen()
             log.info("← %s", body)
             try:

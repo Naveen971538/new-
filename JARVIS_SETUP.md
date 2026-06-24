@@ -46,6 +46,19 @@ iMessage, and is powered by the free, fast **Cerebras** API.
 - `/status` health check (uptime, last poll, DB size, disk free, Messages.app
   state, Wi-Fi network, counts)
 
+**Security**
+- **Strict single-sender allowlist** — only the one phone number/Apple ID set
+  in `MY_IMESSAGE_ID` can talk to JARVIS. Messages from anyone else (a
+  stranger, or even your own *other* Apple ID handle, e.g. your linked email,
+  if it's not the one configured) are never processed as commands and never
+  get a reply.
+- **Intrusion logging + one-time alert** — every blocked attempt is recorded
+  (`/security` to view, also shown on the dashboard), and you get a single
+  iMessage alert the first time an unrecognized contact tries (no spam on
+  repeat attempts from the same sender, until JARVIS restarts).
+- Phone numbers are matched format-tolerantly (spaces/dashes/country code
+  variations all match your number), so this can't accidentally lock you out.
+
 ## One-time setup on the Mac
 
 1. **Download the latest code**
@@ -118,4 +131,4 @@ cp ~/jarvis/jarvis.py.bak ~/jarvis/jarvis.py && bash ~/jarvis/update.sh
 ## Commands
 `/help /status /tasks /task /done /goals /goal /remember /recall /weather
 /screenshot /clipboard /copy /voice /say /calendar /remind /mail /briefing
-/review /evolve /open /find /dashboard` — anything else is a normal chat.
+/review /evolve /open /find /dashboard /security` — anything else is a normal chat.
