@@ -35,21 +35,29 @@ actually gave — that list is usually the most useful screen in the app.
 Everything is static — no build step, no server-side code, no accounts. All data stays in the
 browser's `localStorage` on that device, and the Settings screen can export it as JSON.
 
-This repository already deploys to GitHub Pages from its root on every push to `main`
-(`.github/workflows/deploy-pages.yml`), so once this is merged the app is live at:
+The repository has a workflow that publishes its root to GitHub Pages on every push to `main`
+(`.github/workflows/deploy-pages.yml`). That workflow is currently failing, because Pages itself
+has never been enabled on the repository — `actions/configure-pages` exits within seconds when
+there's no Pages site to configure. Enabling it is a one-time setting:
+
+1. Repository **Settings → Pages**.
+2. Set **Source** to **GitHub Actions**.
+3. Re-run the failed workflow (or push anything to `main`).
+
+After that, every push to `main` publishes, and this app lives at:
 
 ```
 https://naveen971538.github.io/new-/scrollgate/
 ```
 
-To try it before then, run `python3 -m http.server 8000` inside `scrollgate/` and open your
-machine's LAN address on the phone. Note that iOS only allows Add to Home Screen and service
-workers over HTTPS or on `localhost`, so the installed experience needs the Pages URL.
+Then on the iPhone:
 
-On the iPhone:
-
-1. Open the URL in Safari.
+1. Open that URL in Safari.
 2. Share → **Add to Home Screen**.
+
+iOS only permits Add to Home Screen and service workers over HTTPS or on `localhost`, so the
+installed, offline-capable version needs a real HTTPS host — a `python3 -m http.server` on your
+LAN is fine for a quick look in the browser, but it won't install.
 
 It then launches full-screen like a native app and works offline via the service worker.
 
